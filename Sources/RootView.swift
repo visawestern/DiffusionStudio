@@ -154,6 +154,40 @@ struct BusyIndicator: View {
     }
 }
 
+struct StepRing: View {
+    let done: Int
+    let total: Int
+
+    private var fraction: Double {
+        guard total > 0 else { return 0 }
+        return min(1, max(0, Double(done) / Double(total)))
+    }
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(Color.secondary.opacity(0.18), lineWidth: 12)
+            Circle()
+                .trim(from: 0, to: fraction)
+                .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 12, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+                .animation(.easeInOut(duration: 0.35), value: fraction)
+            VStack(spacing: 2) {
+                Text("\(done)")
+                    .font(.system(size: 30, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+                Text("из \(total)")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+        }
+        .frame(width: 132, height: 132)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Выполнено шагов: \(done) из \(total)")
+    }
+}
+
 struct RootView: View {
     @StateObject private var model = SettingsModel()
     @StateObject private var runner = GenerationRunner()
@@ -824,6 +858,27 @@ struct RootView: View {
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
                         .truncationMode(.middle)
+                } else if runner.isRunning {
+                    VStack(spacing: 12) {
+                        Spacer()
+                        if runner.stage == .sampling, runner.samplingStepsTotal > 0 {
+                            StepRing(done: runner.samplingStepsDone, total: runner.samplingStepsTotal)
+                            Text(runner.samplingStepText)
+                                .font(.system(size: 13, weight: .semibold))
+                            Text(runner.samplingRemainingText)
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        } else {
+                            BusyIndicator(isBusy: true)
+                            Text(runner.stage.rawValue)
+                                .font(.system(size: 13, weight: .semibold))
+                            Text("Готовим следующий шаг — картинка появится в конце")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.tertiary)
+                        }
+                        Spacer()
+                    }
                 } else {
                     VStack(spacing: 10) {
                         Image(systemName: "photo.on.rectangle.angled")
@@ -831,7 +886,7 @@ struct RootView: View {
                             .foregroundStyle(.tertiary)
                         Text("Здесь появится результат")
                             .foregroundStyle(.secondary)
-                        Text(runner.isRunning ? "генерация идёт — картинка появится в конце" : "картинка появится после генерации")
+                        Text("картинка появится после генерации")
                             .font(.system(size: 10))
                             .foregroundStyle(.tertiary)
                     }

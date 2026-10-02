@@ -44,6 +44,11 @@ final class GenerationRunner: ObservableObject {
     /// только появляются фактические замеры из лога.
     @Published private(set) var budget: StageBudget?
 
+    /// Сколько секунд прошло с завершения предыдущего шага сэмплирования.
+    /// Обновляется секундным таймером, чтобы остаток текущего шага тикал даже
+    /// когда сервер молчит по 15–20 минут.
+    @Published private(set) var samplingStepElapsed: Double = 0
+
     /// Сколько секунд прошло внутри текущей стадии — им меряется прогресс
     /// стадий, для которых `sd-cli` не даёт точного счётчика.
     @Published private(set) var stageElapsed: Double = 0
@@ -126,6 +131,51 @@ final class GenerationRunner: ObservableObject {
         return "\(stepsDone)/\(stepsTotal) · \(rate)"
     }
 
+    /// Числитель и знаменатель для кольца прогресса в области картинки.
+    var samplingStepsDone: Int {
+        guard stepsTotal > 0 else { return 0 }
+        return min(max(0, stepsDone), stepsTotal)
+    }
+
+    var samplingStepsTotal: Int { max(0, stepsTotal) }
+    var samplingStepsRemaining: Int { max(0, samplingStepsTotal - samplingStepsDone) }
+
+    /// Ожидаемая длительность одного шага: сначала прогноз из бюджета, затем
+    /// фактический замер из строки `N/M - Xs/it`.
+    var samplingStepRate: Double? {
+        if secondsPerStep > 0 { return secondsPerStep }
+        guard let budget, stepsTotal > 0 else { return nil }
+        let expected = budget.sampling / Double(max(1, stepsTotal))
+        return expected > 0 ? expected : nil
+    }
+
+    /// Остаток сэмплирования в секундах. Текущий незавершённый шаг уменьшается
+    /// по таймеру, поэтому цифра живёт даже между построчными отчётами сервера.
+    var samplingRemainingSeconds: Double? {
+        guard stage == .sampling else { return nil }
+        let remaining = Double(samplingStepsRemaining)
+        guard remaining > 0, let rate = samplingStepRate, rate > 0 else { return nil }
+        let currentElapsed = min(max(0, samplingStepElapsed), rate)
+        return max(0, remaining * rate - currentElapsed)
+    }
+
+    var samplingStepText: String {
+        guard samplingStepsTotal > 0 else { return "Шаги появятся после начала сэмплирования" }
+        return "Шаг \(samplingStepsDone) из \(samplingStepsTotal)"
+    }
+
+    var samplingRemainingText: String {
+        guard stage == .sampling, samplingStepsTotal > 0 else {
+            return "Остаток шагов появится после начала сэмплирования"
+        }
+        let remaining = samplingStepsRemaining
+        var text = "Осталось \(remaining) \(GenerationSettings.stepsWord(remaining))"
+        if let seconds = samplingRemainingSeconds {
+            text += " · ≈ " + GenerationSettings.human(seconds)
+        }
+        return text
+    }
+
     var logVisibleHint: String {
         guard let eta = etaSeconds else { return "" }
         return "осталось ≈ " + GenerationSettings.human(eta)
@@ -165,6 +215,7 @@ final class GenerationRunner: ObservableObject {
     private var generationTask: Task<Void, Never>?
     private var pollTimer: Timer?
     private var startedAt: Date?
+    private var lastStepObservedAt: Date?
 
     func clearLog() {
         logLines.removeAll()
@@ -201,6 +252,8 @@ final class GenerationRunner: ObservableObject {
         highestFraction = 0
         fraction = 0
         stageElapsed = 0
+        samplingStepElapsed = 0
+        lastStepObservedAt = Date()
         budget = StageBudget.projected(settings: settings)
     }
 
@@ -425,6 +478,12 @@ final class GenerationRunner: ObservableObject {
         }
         guard target.pipelineIndex > stage.pipelineIndex || (target == stage) else { return }
         enterStage(target)
+        if target == .sampling {
+            // Отсчёт текущего шага начинается именно здесь, а не с начала всей
+            // генерации: загрузка и кодирование уже позади.
+            lastStepObservedAt = Date()
+            samplingStepElapsed = 0
+        }
     }
 
     private func normalized(_ line: String) -> String { line.lowercased() }
@@ -494,8 +553,13 @@ final class GenerationRunner: ObservableObject {
               let rateText = capture(match, at: 3, in: line),
               let unitText = capture(match, at: 4, in: line) else { return }
         guard let done = Double(doneText), let total = Double(totalText), let rate = Double(rateText) else { return }
+        let previousDone = stepsDone
         stepsDone = Int(done)
         stepsTotal = Int(total)
+        if stage == .sampling, stepsDone > previousDone {
+            lastStepObservedAt = Date()
+            samplingStepElapsed = 0
+        }
         if unitText == "s/it" {
             secondsPerStep = rate
         } else if rate > 0 {
@@ -522,6 +586,9 @@ final class GenerationRunner: ObservableObject {
         guard isRunning else { return }
         if let stageStartedAt = stageStartedAt {
             stageElapsed = Date().timeIntervalSince(stageStartedAt)
+        }
+        if let lastStepObservedAt = lastStepObservedAt {
+            samplingStepElapsed = Date().timeIntervalSince(lastStepObservedAt)
         }
         updateFraction()
     }

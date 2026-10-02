@@ -267,7 +267,16 @@ func checkRunnerReplay() async {
     replayLine("[INFO   ] llm.cpp:1  - split prompt \" \" to 276 tokens")
     replayLine("[INFO   ] main.cpp:400 - generate_image 768x1024")
     replayLine("[INFO   ] llm.cpp:900 - get_learned_condition completed, taking 495.86s")
+    check("кольцо знает общее число шагов до первой строки", replay.samplingStepsTotal == 24 && replay.samplingStepsDone == 0)
+    check("остаток до первого шага считается из прогноза", (replay.samplingRemainingSeconds ?? -1) > 0)
     replayLine("  |======>                                           | 3/24 - 2448.47s/it")
+    check("кольцо показывает текущий шаг", replay.samplingStepText == "Шаг 3 из 24", replay.samplingStepText)
+    check("после третьего шага остался 21 шаг", replay.samplingRemainingText.hasPrefix("Осталось 21 шаг"), replay.samplingRemainingText)
+    if let remaining = replay.samplingRemainingSeconds {
+        check("остаток сэмплирования считается по замеру шага", abs(remaining - 21 * 2448.47) < 2.0, "\(remaining)")
+    } else {
+        check("остаток сэмплирования считается по замеру шага", false)
+    }
     replayLine("[INFO   ] image.cpp:899  - sampling completed, taking 26040.83s")
     replayLine("[INFO   ] vae.hpp:200 - latent 0 decoded, taking 637.79s")
     replayLine("[INFO   ] main.cpp:497  - save result image 0 to 'outputs/x.png' (success)")
