@@ -73,6 +73,45 @@ enum ModelSet: String, CaseIterable, Identifiable, Codable {
     var memoryNote: String { "веса 14.6 ГБ, энкодер требует ~8 ГБ ОЗУ" }
 }
 
+enum ResolutionScale: String, CaseIterable, Identifiable, Codable {
+    case mini = "Мини"
+    case half = "50%"
+    case threeQuarters = "75%"
+    case full = "100%"
+
+    var id: String { rawValue }
+
+    func size(for base: (width: Int, height: Int)) -> (width: Int, height: Int) {
+        // «Мини» всегда доводит короткую сторону до 192 px. Для прямоугольных
+        // пропорций это ровно четверть базового кадра; квадрат тоже остаётся
+        // квадратом 192×192. Остальные варианты масштабируют обе стороны
+        // одинаковым множителем и сохраняют пропорцию точно.
+        if self == .mini {
+            guard base.width != base.height else { return (192, 192) }
+            let shortSide = 192.0
+            if base.width > base.height {
+                return (Int((Double(base.width) * shortSide / Double(base.height)).rounded()), 192)
+            }
+            return (192, Int((Double(base.height) * shortSide / Double(base.width)).rounded()))
+        }
+
+        let factor: Double = switch self {
+        case .half: 0.5
+        case .threeQuarters: 0.75
+        case .full, .mini: 1.0
+        }
+        return (
+            Int((Double(base.width) * factor).rounded()),
+            Int((Double(base.height) * factor).rounded())
+        )
+    }
+
+    func label(for base: (width: Int, height: Int)) -> String {
+        let scaled = size(for: base)
+        return "\(rawValue) · \(scaled.width)×\(scaled.height)"
+    }
+}
+
 enum AspectPreset: String, CaseIterable, Identifiable, Codable {
     case square = "1:1"
     case landscape43 = "4:3"
@@ -82,9 +121,9 @@ enum AspectPreset: String, CaseIterable, Identifiable, Codable {
 
     var id: String { rawValue }
 
-    /// Размеры, на которых модель обучалась. Только эти: промежуточный размер
-    /// модель рисует криво — пропорции плывут, а мелкие детали рассыпаются.
-    /// Всё остальное проще доделать в редакторе, чем ждать искажённый результат.
+    /// Базовые пропорции и полные размеры, от которых строятся все варианты.
+    /// Масштаб уменьшает обе стороны одинаково, поэтому пропорция сохраняется,
+    /// а картинка становится меньше и считается быстрее.
     var size: (width: Int, height: Int) {
         switch self {
         case .square: return (1024, 1024)
@@ -95,10 +134,7 @@ enum AspectPreset: String, CaseIterable, Identifiable, Codable {
         }
     }
 
-    var label: String {
-        let s = size
-        return "\(rawValue) · \(s.width)×\(s.height)"
-    }
+    var label: String { rawValue }
 }
 
 enum Sampler: String, CaseIterable, Identifiable, Codable {
@@ -171,7 +207,7 @@ final class SettingsModel: ObservableObject {
 
     func normalize() {
         s.applyModelSet()
-        s.applyAspect()
+        s.applySize()
         if s.outputDirectory.isEmpty {
             s.outputDirectory = URL(fileURLWithPath: s.rootPath).appendingPathComponent("outputs").path
         }
@@ -201,41 +237,112 @@ final class SettingsModel: ObservableObject {
 }
 
 struct GenerationSettings: Codable, Equatable {
-    var rootPath: String = AppConstants.defaultRoot
-    var modelSet: ModelSet = .qwenImage21Q6
+    init() {
+        rootPath = AppConstants.defaultRoot
+        modelSet = .qwenImage21Q6
+        diffusionModel = ModelSet.qwenImage21Q6.diffusion
+        encoderModel = ModelSet.qwenImage21Q6.encoder
+        vaeModel = ModelSet.qwenImage21Q6.vae
+        prompt = ""
+        negativePrompt = Defaults.negative
+        aspect = .portrait34
+        scale = .full
+        width = 768
+        height = 1024
+        steps = 20
+        cfgScale = 4.0
+        flowShift = 3.0
+        sampler = .euler
+        seed = 42
+        randomSeed = false
+        batchCount = 1
+        threads = 8
+        backend = .cpu
+        maxVRAM = 0
+        diffusionFA = true
+        vaeTiling = true
+        offloadToCPU = false
+        disableSegmentedCompute = false
+        eagerLoad = false
+        outputDirectory = ""
+        outputName = "output"
+        verbose = true
+    }
 
-    var diffusionModel: String = ModelSet.qwenImage21Q6.diffusion
-    var encoderModel: String = ModelSet.qwenImage21Q6.encoder
-    var vaeModel: String = ModelSet.qwenImage21Q6.vae
+    /// Старые сохранённые настройки могут не содержать полей, добавленных
+    /// позже. Поэтому отсутствующие значения заменяются текущими значениями
+    /// по умолчанию, а не роняют весь файл настроек.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let defaults = Self()
 
-    var prompt: String = ""
-    var negativePrompt: String = Defaults.negative
+        rootPath = try container.decodeIfPresent(String.self, forKey: .rootPath) ?? defaults.rootPath
+        modelSet = try container.decodeIfPresent(ModelSet.self, forKey: .modelSet) ?? defaults.modelSet
+        diffusionModel = try container.decodeIfPresent(String.self, forKey: .diffusionModel) ?? defaults.diffusionModel
+        encoderModel = try container.decodeIfPresent(String.self, forKey: .encoderModel) ?? defaults.encoderModel
+        vaeModel = try container.decodeIfPresent(String.self, forKey: .vaeModel) ?? defaults.vaeModel
+        prompt = try container.decodeIfPresent(String.self, forKey: .prompt) ?? defaults.prompt
+        negativePrompt = try container.decodeIfPresent(String.self, forKey: .negativePrompt) ?? defaults.negativePrompt
+        aspect = try container.decodeIfPresent(AspectPreset.self, forKey: .aspect) ?? defaults.aspect
+        scale = try container.decodeIfPresent(ResolutionScale.self, forKey: .scale) ?? defaults.scale
+        width = try container.decodeIfPresent(Int.self, forKey: .width) ?? defaults.width
+        height = try container.decodeIfPresent(Int.self, forKey: .height) ?? defaults.height
+        steps = try container.decodeIfPresent(Int.self, forKey: .steps) ?? defaults.steps
+        cfgScale = try container.decodeIfPresent(Double.self, forKey: .cfgScale) ?? defaults.cfgScale
+        flowShift = try container.decodeIfPresent(Double.self, forKey: .flowShift) ?? defaults.flowShift
+        sampler = try container.decodeIfPresent(Sampler.self, forKey: .sampler) ?? defaults.sampler
+        seed = try container.decodeIfPresent(Int.self, forKey: .seed) ?? defaults.seed
+        randomSeed = try container.decodeIfPresent(Bool.self, forKey: .randomSeed) ?? defaults.randomSeed
+        batchCount = try container.decodeIfPresent(Int.self, forKey: .batchCount) ?? defaults.batchCount
+        threads = try container.decodeIfPresent(Int.self, forKey: .threads) ?? defaults.threads
+        backend = try container.decodeIfPresent(BackendChoice.self, forKey: .backend) ?? defaults.backend
+        maxVRAM = try container.decodeIfPresent(Double.self, forKey: .maxVRAM) ?? defaults.maxVRAM
+        diffusionFA = try container.decodeIfPresent(Bool.self, forKey: .diffusionFA) ?? defaults.diffusionFA
+        vaeTiling = try container.decodeIfPresent(Bool.self, forKey: .vaeTiling) ?? defaults.vaeTiling
+        offloadToCPU = try container.decodeIfPresent(Bool.self, forKey: .offloadToCPU) ?? defaults.offloadToCPU
+        disableSegmentedCompute = try container.decodeIfPresent(Bool.self, forKey: .disableSegmentedCompute) ?? defaults.disableSegmentedCompute
+        eagerLoad = try container.decodeIfPresent(Bool.self, forKey: .eagerLoad) ?? defaults.eagerLoad
+        outputDirectory = try container.decodeIfPresent(String.self, forKey: .outputDirectory) ?? defaults.outputDirectory
+        outputName = try container.decodeIfPresent(String.self, forKey: .outputName) ?? defaults.outputName
+        verbose = try container.decodeIfPresent(Bool.self, forKey: .verbose) ?? defaults.verbose
+    }
 
-    var aspect: AspectPreset = .portrait34
-    var width: Int = 768
-    var height: Int = 1024
+    var rootPath: String
+    var modelSet: ModelSet
 
-    var steps: Int = 20
-    var cfgScale: Double = 4.0
-    var flowShift: Double = 3.0
-    var sampler: Sampler = .euler
-    var seed: Int = 42
-    var randomSeed: Bool = false
-    var batchCount: Int = 1
+    var diffusionModel: String
+    var encoderModel: String
+    var vaeModel: String
 
-    var threads: Int = 8
-    var backend: BackendChoice = .cpu
-    var maxVRAM: Double = 0
+    var prompt: String
+    var negativePrompt: String
 
-    var diffusionFA: Bool = true
-    var vaeTiling: Bool = true
-    var offloadToCPU: Bool = false
-    var disableSegmentedCompute: Bool = false
-    var eagerLoad: Bool = false
+    var aspect: AspectPreset
+    var scale: ResolutionScale
+    var width: Int
+    var height: Int
 
-    var outputDirectory: String = ""
-    var outputName: String = "output"
-    var verbose: Bool = true
+    var steps: Int
+    var cfgScale: Double
+    var flowShift: Double
+    var sampler: Sampler
+    var seed: Int
+    var randomSeed: Bool
+    var batchCount: Int
+
+    var threads: Int
+    var backend: BackendChoice
+    var maxVRAM: Double
+
+    var diffusionFA: Bool
+    var vaeTiling: Bool
+    var offloadToCPU: Bool
+    var disableSegmentedCompute: Bool
+    var eagerLoad: Bool
+
+    var outputDirectory: String
+    var outputName: String
+    var verbose: Bool
 
     var resolvedOutputDirectory: String {
         outputDirectory.isEmpty
@@ -243,10 +350,10 @@ struct GenerationSettings: Codable, Equatable {
             : outputDirectory
     }
 
-    var resolvedSize: (width: Int, height: Int) { aspect.size }
+    var resolvedSize: (width: Int, height: Int) { scale.size(for: aspect.size) }
 
-    /// Размер всегда берётся из пресета пропорций: произвольных значений нет.
-    mutating func applyAspect() {
+    /// Размер всегда собирается из пропорции и масштаба: произвольных значений нет.
+    mutating func applySize() {
         let r = resolvedSize
         width = r.width
         height = r.height

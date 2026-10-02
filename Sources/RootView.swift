@@ -456,9 +456,20 @@ struct RootView: View {
                 Label("Размер", systemImage: "aspectratio")
                     .font(.system(size: 11, weight: .semibold))
 
-                FieldRow(label: "Размер кадра", help: "Только те размеры, на которых модель обучалась. Другие пропорции она рисует криво: предметы вытягиваются, а мелкие детали рассыпаются. Нужный кадр проще вырезать или дорисовать в редакторе — это секунды, а лишняя генерация — часы.") {
-                    Picker("Размер кадра", selection: s.aspect) {
+                FieldRow(label: "Пропорции", help: "Пропорции зафиксированы на обучающих кадрах. Масштаб ниже уменьшает обе стороны одинаково, поэтому кадр не вытягивается.") {
+                    Picker("Пропорции", selection: s.aspect) {
                         ForEach(AspectPreset.allCases) { Text($0.label).tag($0) }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                FieldRow(label: "Масштаб кадра", help: "«Мини» доводит короткую сторону до 192 px — быстрый черновой кадр. 100% — полный обучающий размер. Маленький кадр считается быстрее, но деталей в нём меньше; финальную картинку лучше делать на 100%.") {
+                    Picker("Масштаб кадра", selection: s.scale) {
+                        ForEach(ResolutionScale.allCases) {
+                            Text($0.label(for: model.s.aspect.size)).tag($0)
+                        }
                     }
                     .labelsHidden()
                     .pickerStyle(.menu)

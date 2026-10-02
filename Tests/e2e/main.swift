@@ -9,6 +9,7 @@ func runE2E() async -> Int32 {
     s.steps = 1
     s.cfgScale = 2.0
     s.aspect = .square
+    s.scale = .mini
     s.threads = 8
     s.backend = .cpu
     s.verbose = false

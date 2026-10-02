@@ -121,10 +121,55 @@ for preset in AspectPreset.allCases {
 var sized = GenerationSettings()
 for preset in AspectPreset.allCases {
     sized.aspect = preset
-    sized.applyAspect()
+    sized.applySize()
     check("resolve(\(preset.rawValue)) даёт обучающий размер",
           sized.width == preset.size.width && sized.height == preset.size.height)
 }
+
+// Масштаб уменьшает обе стороны одинаково: пропорция сохраняется, а самый
+// маленький вариант начинается с короткой стороны 192 px.
+let scaledSizes: [AspectPreset: [ResolutionScale: (Int, Int)]] = [
+    .square: [.mini: (192, 192), .half: (512, 512), .threeQuarters: (768, 768), .full: (1024, 1024)],
+    .landscape43: [.mini: (256, 192), .half: (512, 384), .threeQuarters: (768, 576), .full: (1024, 768)],
+    .portrait34: [.mini: (192, 256), .half: (384, 512), .threeQuarters: (576, 768), .full: (768, 1024)],
+    .landscape169: [.mini: (336, 192), .half: (672, 384), .threeQuarters: (1008, 576), .full: (1344, 768)],
+    .portrait916: [.mini: (192, 336), .half: (384, 672), .threeQuarters: (576, 1008), .full: (768, 1344)],
+]
+
+check("пять пропорций на четыре масштаба дают 20 размеров",
+      AspectPreset.allCases.count * ResolutionScale.allCases.count == 20)
+
+for preset in AspectPreset.allCases {
+    let base = preset.size
+    for scale in ResolutionScale.allCases {
+        let actual = scale.size(for: base)
+        let expected = scaledSizes[preset]![scale]!
+        check("\(preset.rawValue) \(scale.rawValue) даёт точный пропорциональный размер",
+              actual.width == expected.0 && actual.height == expected.1,
+              "\(actual.width)x\(actual.height)")
+        check("\(preset.rawValue) \(scale.rawValue) сохраняет пропорцию",
+              actual.width * base.height == actual.height * base.width)
+    }
+    let mini = ResolutionScale.mini.size(for: base)
+    check("\(preset.rawValue) в масштабе «Мини» начинается с короткой стороны 192",
+          min(mini.width, mini.height) == 192)
+}
+
+var scaled = GenerationSettings()
+scaled.aspect = .landscape169
+scaled.scale = .mini
+scaled.applySize()
+check("настройки применяют выбранный масштаб", scaled.width == 336 && scaled.height == 192)
+check("по умолчанию используется полный размер",
+      GenerationSettings().scale == .full && GenerationSettings().resolvedSize.width == 768)
+
+// Старые сохранённые настройки без поля масштаба должны открываться как 100%.
+let legacySettings = try JSONDecoder().decode(
+    GenerationSettings.self,
+    from: Data(#"{"aspect":"3:4"}"#.utf8)
+)
+check("старые настройки получают полный масштаб по умолчанию",
+      legacySettings.scale == .full && legacySettings.resolvedSize.width == 768)
 
 print("=== 3. Валидация ===")
 var bad = GenerationSettings()
