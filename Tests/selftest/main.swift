@@ -12,7 +12,7 @@ func check(_ name: String, _ condition: Bool, _ detail: String = "") {
     }
 }
 
-print("=== 1. Генератор аргументов ===")
+print("=== 1. Тело запроса к sd-server ===")
 
 var s = GenerationSettings()
 s.rootPath = "/tmp/root"
@@ -30,47 +30,71 @@ s.batchCount = 1
 s.threads = 8
 s.backend = .cpu
 s.maxVRAM = 0
-s.preview = .none
 s.diffusionFA = false
 s.vaeTiling = false
 s.outputName = "argcheck"
 s.verbose = false
 
-let args = s.buildArguments()
-print("  " + args.joined(separator: " "))
+let body = EngineServer.requestBody(s)
+let json = String(data: try JSONSerialization.data(withJSONObject: body), encoding: .utf8) ?? ""
+print("  " + json)
 
-check("есть --diffusion-model", args.contains("--diffusion-model"))
-check("путь к модели относительный", args.firstIndex(of: "--diffusion-model").map { args[$0 + 1].hasPrefix("models/") } ?? false)
-check("размер 512x512", args.contains("512"))
-check("steps передан", args.contains("--steps") && args.contains("8"))
-check("backend=cpu", args.contains("cpu"))
-check("vf не включён без флага", !args.contains("-v"))
-check("negative prompt не передаётся при пустом", !args.contains("-n"))
-check("seed положительный", (args.firstIndex(of: "-s").map { args[$0 + 1] } == "42"))
-check("нет пустых аргументов", !args.contains(""))
-check("выход в outputs/", args.contains { $0.hasSuffix("/outputs/argcheck.png") })
+let size = s.resolvedSize
+check("размер в теле запроса", (body["width"] as? Int) == size.width && (body["height"] as? Int) == size.height)
+check("промпт передан", body["prompt"] as? String == "test prompt")
+check("пустой negative prompt передан пустым", (body["negative_prompt"] as? String)?.isEmpty == true)
+check("seed положительный", (body["seed"] as? Int) == 42)
 
-s.negativePrompt = "blurry"
+guard let params = body["sample_params"] as? [String: Any] else {
+    check("sample_params есть", false)
+    exit(1)
+}
+check("steps передан", (params["sample_steps"] as? Int) == 8)
+check("сэмплер передан", (params["sample_method"] as? String) == "euler")
+check("flow shift передан", (params["flow_shift"] as? Double) == 3.0)
+guard let guidance = params["guidance"] as? [String: Any] else {
+    check("guidance есть", false)
+    exit(1)
+}
+check("cfg = txt_cfg", (guidance["txt_cfg"] as? Double) == 2.5)
+guard let tiling = body["vae_tiling_params"] as? [String: Any] else {
+    check("vae_tiling_params есть", false)
+    exit(1)
+}
+check("тайлинг выключен флагом", (tiling["enabled"] as? Bool) == false)
+check("формат png", body["output_format"] as? String == "png")
+check("в теле запроса нет лишних ключей", body.count == 9, "ключей: \(body.count)")
+
 s.randomSeed = true
-s.verbose = true
-s.preview = .proj
-s.previewInterval = 1
-s.diffusionFA = true
+s.negativePrompt = "blurry"
+s.cfgScale = 7.0
+s.sampler = .dpmPP2m
 s.vaeTiling = true
-s.backend = .auto
-s.maxVRAM = 6
 s.aspect = .a4
 s.longEdge = 1024
-let args2 = s.buildArguments()
-print("  " + args2.joined(separator: " "))
+let body2 = EngineServer.requestBody(s)
+print("  " + (String(data: try JSONSerialization.data(withJSONObject: body2), encoding: .utf8) ?? ""))
+check("random seed = -1", (body2["seed"] as? Int) == -1)
+check("negative prompt передан", body2["negative_prompt"] as? String == "blurry")
+check("смена сэмплера", (body2["sample_params"] as? [String: Any])?["sample_method"] as? String == "dpm++2m")
+check("A4 даёт 1024x1408", (body2["width"] as? Int) == 1024 && (body2["height"] as? Int) == 1408)
+check("тайлинг включён флагом", ((body2["vae_tiling_params"] as? [String: Any])?["enabled"] as? Bool) == true)
 
-check("negative prompt передан", args2.contains("-n") && args2.contains("blurry"))
-check("random seed = -1", (args2.firstIndex(of: "-s").map { args2[$0 + 1] } == "-1"))
-check("auto-fit вместо backend", args2.contains("--auto-fit"))
-check("max-vram передан", args2.contains("mtl0=6.0"))
-check("preview + path", args2.contains("--preview") && args2.contains("proj") && args2.contains("--preview-path"))
-check("флаги оптимизации", args2.contains("--diffusion-fa") && args2.contains("--vae-tiling"))
-check("A4 даёт 1024x1408", args2.contains("1024") && args2.contains("1408"))
+print("=== 1b. Отпечаток запуска движка ===")
+let fpA = EngineServer.launchFingerprint(s)
+var s2 = s
+s2.prompt = "другой промпт"
+s2.steps = 3
+check("промпт не меняет отпечаток", EngineServer.launchFingerprint(s2) == fpA)
+var s3 = s
+s3.diffusionModel = "другая.gguf"
+check("смена модели меняет отпечаток", EngineServer.launchFingerprint(s3) != fpA)
+var s4 = s
+s4.threads = 4
+check("смена потоков меняет отпечаток", EngineServer.launchFingerprint(s4) != fpA)
+var s5 = s
+s5.vaeTiling = !s.vaeTiling
+check("смена тайлинга меняет отпечаток", EngineServer.launchFingerprint(s5) != fpA)
 
 print("=== 2. Размеры по пресетам ===")
 for preset in AspectPreset.allCases {
@@ -86,7 +110,7 @@ check("пустой промпт ловится", !bad.problems.isEmpty)
 var noModels = GenerationSettings()
 noModels.prompt = "x"
 noModels.rootPath = "/nonexistent/path"
-check("отсутствие бинаря ловится", noModels.problems.contains { $0.contains("Не найден исполняемый") })
+check("отсутствие sd-server ловится", noModels.problems.contains { $0.contains("Нет бинаря sd-server") })
 var autoMode = GenerationSettings()
 autoMode.prompt = "x"
 autoMode.backend = .auto
@@ -150,6 +174,130 @@ check("фрагмент не выдаётся преждевременно", tai
 collector2.feed(Data(" и продолжение\n".utf8))
 print("  склейка фрагментов: \(tail)")
 check("фрагменты склеиваются", tail == ["начало без конца и продолжение"])
+
+print("=== 6. Модель бюджета стадий ===")
+
+var big = GenerationSettings()
+big.prompt = String(repeating: "document page with a table and a signature, ", count: 12)
+big.aspect = .portrait34
+big.longEdge = 1024
+big.steps = 24
+let bigBudget = StageBudget.projected(settings: big)
+
+let weights = RunStage.pipeline.map { bigBudget.weight(of: $0) }
+let weightSum = weights.reduce(0, +)
+print(String(format: "  суммарно ≈ %@", GenerationSettings.human(bigBudget.total)))
+for (i, stage) in RunStage.pipeline.enumerated() {
+    print(String(format: "    %@: %@ (%.2f%%)", stage.rawValue,
+                 GenerationSettings.human(bigBudget.seconds(for: stage)), weights[i] * 100))
+}
+
+check("все стадии имеют положительный вес", weights.allSatisfy { $0 > 0 })
+check("веса в сумме дают 100%", abs(weightSum - 1.0) < 1e-9, "\(weightSum)")
+check("сэмплирование — самая тяжёлая стадия", bigBudget.sampling == bigBudget.seconds(for: .sampling))
+let summed = RunStage.pipeline.reduce(0.0) { $0 + bigBudget.seconds(for: $1) }
+check("бюджет совпадает с суммой стадий", abs(bigBudget.total - summed) < 1e-6)
+
+var offsets: [Double] = []
+for stage in RunStage.pipeline {
+    offsets.append(bigBudget.offset(of: stage))
+}
+check("смещения стадий возрастают", zip(offsets, offsets.dropFirst()).allSatisfy { $0 <= $1 + 1e-12 })
+check("смещение первой стадии = 0", abs(offsets[0]) < 1e-12)
+check("после последней стадии остаётся её вес", abs((offsets[4] + weights[4]) - 1.0) < 1e-9)
+
+// Замеры из логов должны воспроизводиться моделью в опорных точках.
+let refSampling = PowerCurve.value(x: 786_432, anchors: Measured.samplingAnchors)
+let ref512Sampling = PowerCurve.value(x: 262_144, anchors: Measured.samplingAnchors)
+let refDecoding = PowerCurve.value(x: 786_432, anchors: Measured.decodingAnchors)
+print(String(format: "  сэмплирование: %.1f с/шаг при 768x1024, %.1f при 512x512",
+             refSampling, ref512Sampling))
+print(String(format: "  декодирование: %.1f с при 768x1024", refDecoding))
+check("опорная точка сэмплирования 768x1024", abs(refSampling - 1085.03) < 0.5, "\(refSampling)")
+check("опорная точка сэмплирования 512x512", abs(ref512Sampling - 818.97) < 0.5, "\(ref512Sampling)")
+check("опорная точка декодирования", abs(refDecoding - 637.79) < 0.5, "\(refDecoding)")
+check("кривая монотонна", PowerCurve.value(x: 100_000, anchors: Measured.samplingAnchors)
+        < PowerCurve.value(x: 700_000, anchors: Measured.samplingAnchors))
+
+// Фактические замеры из лога важнее модели.
+let calibrated = StageBudget.projected(
+    settings: big,
+    promptTokens: 276,
+    measuredStepSeconds: 2448.47
+)
+check("замер скорости шага переопределяет модель",
+      abs(calibrated.sampling - 2448.47 * 24) < 0.001, "\(calibrated.sampling)")
+let calibratedLoad = StageBudget.projected(settings: big, measuredLoading: 146.84)
+check("замер загрузки переопределяет модель", abs(calibratedLoad.loading - 146.84) < 0.001)
+
+@MainActor
+func checkRunnerReplay() async {
+    print("=== 7. Прогресс по стадиям на реальном логе ===")
+
+    let replay = GenerationRunner()
+    replay.currentSettings = big
+    replay.beginTracking(big)
+
+    func replayLine(_ line: String) {
+        replay.consume(line)
+    }
+
+    replayLine("[INFO   ] llm.cpp:1  - split prompt \" \" to 276 tokens")
+    replayLine("[INFO   ] main.cpp:400 - generate_image 768x1024")
+    replayLine("[INFO   ] llm.cpp:900 - get_learned_condition completed, taking 495.86s")
+    replayLine("  |======>                                           | 3/24 - 2448.47s/it")
+    replayLine("[INFO   ] image.cpp:899  - sampling completed, taking 26040.83s")
+    replayLine("[INFO   ] vae.hpp:200 - latent 0 decoded, taking 637.79s")
+    replayLine("[INFO   ] main.cpp:497  - save result image 0 to 'outputs/x.png' (success)")
+    replayLine("[INFO   ] image.cpp:1050 - generate_image completed in 27174.79s")
+
+    print(String(format: "  стадия: %@, прогресс %.1f%%", replay.stage.rawValue, replay.progressFraction * 100))
+    for row in replay.stageBreakdown {
+        print(String(format: "    %@ %@ %.0f%%", row.title, row.state == .finished ? "✓" : " ", row.progress * 100))
+    }
+
+    check("токены взяты из лога", replay.promptTokens == 276)
+    check("стадия дошла до завершения", replay.stage == .done, replay.stage.rawValue)
+    check("на завершении ровно 100%", abs(replay.progressFraction - 1.0) < 1e-9, "\(replay.progressFraction)")
+    check("прогресс = 100.0%", replay.percentText == "100.0%", replay.percentText)
+    check("шаги считаются из строки прогресса", replay.stepsDone == 3 && replay.stepsTotal == 24)
+    check("замер кодирования подхвачен", replay.measuredEncoding == 495.86)
+    check("замер декодирования подхвачен", replay.measuredDecoding == 637.79)
+    check("все стадии закрыты", replay.stageBreakdown.allSatisfy { $0.state == .finished })
+
+    // Стадии не могут идти назад даже при перемешанных строках лога.
+    let rewind = GenerationRunner()
+    rewind.currentSettings = big
+    rewind.beginTracking(big)
+    rewind.consume("[INFO   ] image.cpp:899  - sampling completed, taking 26040.83s")
+    rewind.consume("[INFO   ] main.cpp:400 - generate_image 768x1024")
+    rewind.consume("[INFO   ] llm.cpp:900 - get_learned_condition completed, taking 495.86s")
+    check("стадия не откатывается назад", rewind.stage.pipelineIndex >= RunStage.sampling.pipelineIndex, rewind.stage.rawValue)
+    check("прогресс не уменьшается", rewind.progressFraction > 0)
+
+    // Порог стадии: сумма весов пройденных стадий.
+    var midSettings = big
+    midSettings.steps = 10
+    let mid = GenerationRunner()
+    mid.currentSettings = midSettings
+    mid.beginTracking(midSettings)
+    mid.consume("[INFO   ] llm.cpp:1  - split prompt \" \" to 276 tokens")
+    mid.consume("[INFO   ] main.cpp:400 - generate_image 768x1024")
+    mid.consume("[INFO   ] llm.cpp:900 - get_learned_condition completed, taking 495.86s")
+    mid.consume("  |======>                                           | 0/10 - 2448.47s/it")
+    let midBudget = mid.budget
+    if let midBudget {
+        let floorExpected = midBudget.offset(of: .sampling)
+        print(String(format: "  порог входа в сэмплирование: %.2f%%", floorExpected * 100))
+        check("порог входа равен сумме весов первых стадий",
+              abs(mid.progressFraction - floorExpected) < 1e-9, "\(mid.progressFraction)")
+        check("порог заметно больше нуля", floorExpected > 0.01)
+        check("порог заметно меньше ста", floorExpected < 0.25)
+    }
+}
+
+
+await checkRunnerReplay()
 
 print("")
 if failures == 0 {

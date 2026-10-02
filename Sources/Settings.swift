@@ -55,15 +55,6 @@ enum BackendChoice: String, CaseIterable, Identifiable, Codable {
     }
 }
 
-enum PreviewChoice: String, CaseIterable, Identifiable, Codable {
-    case none = "Выкл"
-    case proj = "proj"
-    case tae = "tae"
-    case vae = "vae"
-
-    var id: String { rawValue }
-}
-
 enum ModelSet: String, CaseIterable, Identifiable, Codable {
     case qwenImage21Q6 = "Qwen-Image 2.1 Q6_K"
     case custom = "Ручной выбор"
@@ -175,8 +166,6 @@ struct GenerationSettings: Codable, Equatable {
     var backend: BackendChoice = .cpu
     var maxVRAM: Double = 0
 
-    var preview: PreviewChoice = .proj
-    var previewInterval: Int = 1
     var diffusionFA: Bool = true
     var vaeTiling: Bool = true
     var offloadToCPU: Bool = false
@@ -203,12 +192,10 @@ struct GenerationSettings: Codable, Equatable {
             .appendingPathComponent(outputName.hasSuffix(".png") ? outputName : outputName + ".png")
     }
 
-    var previewURL: URL {
-        URL(fileURLWithPath: resolvedOutputDirectory).appendingPathComponent("preview.png")
-    }
-
+    /// Бинарь движка. Генерацию выполняет `sd-server`: он держит веса в памяти
+    /// между запусками, поэтому вторая картинка не читает модель заново.
     var binaryURL: URL {
-        URL(fileURLWithPath: rootPath).appendingPathComponent("build/bin/sd-cli")
+        URL(fileURLWithPath: rootPath).appendingPathComponent("build/bin/sd-server")
     }
 
     mutating func applyModelSet() {
@@ -224,7 +211,7 @@ struct GenerationSettings: Codable, Equatable {
             out.append("Промпт пустой.")
         }
         if !FileManager.default.isExecutableFile(atPath: binaryURL.path) {
-            out.append("Не найден исполняемый файл: \(binaryURL.path)")
+            out.append("Нет бинаря sd-server: \(binaryURL.path). Соберите его: cmake --build build --target sd-server")
         }
         for (label, name) in [("диффузии", diffusionModel), ("энкодера", encoderModel), ("VAE", vaeModel)] {
             if name.isEmpty {
@@ -277,30 +264,30 @@ struct GenerationSettings: Codable, Equatable {
     }
 
     var estimatedCost: (perStep: Double, sampling: Double, total: Double) {
-        let px = Double(width * height)
-        let ratio = px / (768.0 * 1024.0)
-        let perStep = 1085.0 * ratio
-        let sampling = perStep * Double(steps)
-        let encoding = promptEncodingSeconds
-        let decoding = 637.0 * ratio
-        return (perStep, sampling, encoding + decoding + sampling)
-    }
-
-    private var promptEncodingSeconds: Double {
-        let length = Double((prompt as NSString).length)
-        return length > 300 ? 496.0 : 130.0
+        let budget = StageBudget.projected(settings: self)
+        let perStep = budget.sampling / Double(max(1, steps * batchCount))
+        return (perStep, budget.sampling, budget.total)
     }
 
     var estimatedCostText: String {
-        let e = estimatedCost
+        let b = StageBudget.projected(settings: self)
         return String(
-            format: "≈ %@ суммарно · сэмплирование ≈ %@ (%@/шаг) · кодирование промпта ≈ %@ · декод ≈ %@",
-            Self.human(e.total),
-            Self.human(e.sampling),
-            Self.human(e.perStep),
-            Self.human(promptEncodingSeconds),
-            Self.human(637.0 * (Double(width * height) / (768.0 * 1024.0)))
+            format: "всего ≈ %@ · сэмплирование ≈ %@ (%@/шаг) · загрузка ≈ %@ · кодирование ≈ %@ · декод ≈ %@ · запись ≈ %@",
+            GenerationSettings.human(b.total),
+            GenerationSettings.human(b.sampling),
+            GenerationSettings.human(b.sampling / Double(max(1, steps * batchCount))),
+            GenerationSettings.human(b.loading),
+            GenerationSettings.human(b.encoding),
+            GenerationSettings.human(b.decoding),
+            GenerationSettings.human(b.saving)
         )
+    }
+
+    /// Доли стадий в общем времени — те же коэффициенты, что использует
+    /// прогрессбар, чтобы оценка и полоса считались по одной модели.
+    var stageWeights: [(stage: RunStage, weight: Double, seconds: Double)] {
+        let b = StageBudget.projected(settings: self)
+        return RunStage.pipeline.map { ($0, b.weight(of: $0), b.seconds(for: $0)) }
     }
 
     /// Множественное число для «шаг / шага / шагов».
@@ -317,52 +304,6 @@ struct GenerationSettings: Codable, Equatable {
         if seconds < 60 { return String(format: "%.0f с", seconds) }
         if seconds < 3600 { return String(format: "%.0f мин", seconds / 60) }
         return String(format: "%.1f ч", seconds / 3600)
-    }
-
-    func buildArguments() -> [String] {
-        var a: [String] = []
-        let resolved = resolvedSize
-
-        a += ["--diffusion-model", "models/\(diffusionModel)"]
-        a += ["--llm", "models/\(encoderModel)"]
-        a += ["--vae", "models/\(vaeModel)"]
-
-        a += ["-p", prompt]
-        if !negativePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            a += ["-n", negativePrompt]
-        }
-
-        a += ["-W", String(resolved.width)]
-        a += ["-H", String(resolved.height)]
-        a += ["--steps", String(steps)]
-        a += ["--cfg-scale", String(format: "%.2f", cfgScale)]
-        a += ["--flow-shift", String(format: "%.2f", flowShift)]
-        a += ["--sampling-method", sampler.rawValue]
-        a += ["-s", String(randomSeed ? -1 : seed)]
-        if batchCount > 1 { a += ["-b", String(batchCount)] }
-        if threads > 0 { a += ["-t", String(threads)] }
-
-        switch backend {
-        case .cpu: a += ["--backend", "cpu"]
-        case .auto: a += ["--auto-fit"]
-        }
-        if maxVRAM > 0 { a += ["--max-vram", String(format: "mtl0=%.1f", maxVRAM)] }
-
-        if preview != .none {
-            a += ["--preview", preview.rawValue]
-            a += ["--preview-interval", String(max(1, previewInterval))]
-            a += ["--preview-path", previewURL.path]
-        }
-
-        if diffusionFA { a += ["--diffusion-fa"] }
-        if vaeTiling { a += ["--vae-tiling"] }
-        if offloadToCPU { a += ["--offload-to-cpu"] }
-        if disableSegmentedCompute { a += ["--disable-segmented-compute"] }
-        if eagerLoad { a += ["--eager-load"] }
-
-        a += ["-o", outputURL.path]
-        if verbose { a += ["-v"] }
-        return a
     }
 
     func estimatedMemoryText() -> String {

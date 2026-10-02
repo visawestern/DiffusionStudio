@@ -419,7 +419,7 @@ struct RootView: View {
                     .labelsHidden()
                 }
 
-                FieldRow(label: "Движок", help: "Папка со stable-diffusion.cpp фиксирована: здесь лежат build/bin/sd-cli и папка models. Менять её не нужно — выбирается только папка для сохранения картинок. Если переносите движок, задайте переменную окружения DIFFUSION_STUDIO_ROOT.") {
+                FieldRow(label: "Движок", help: "Папка со stable-diffusion.cpp фиксирована: здесь лежат build/bin/sd-server и папка models. Менять её не нужно — выбирается только папка для сохранения картинок. Если переносите движок, задайте переменную окружения DIFFUSION_STUDIO_ROOT.") {
                     Text(model.s.rootPath)
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(.secondary)
@@ -427,6 +427,8 @@ struct RootView: View {
                         .truncationMode(.middle)
                         .textSelection(.enabled)
                 }
+
+                engineRow
 
                 if model.s.modelSet == .qwenImage21Q6 {
                     fileRow("Diffusion", value: model.s.diffusionModel, help: "Файл весов модели. Q6_K — качественный квант, 5.6 ГБ. Q4 был бы быстрее, но качество заметно хуже.")
@@ -442,6 +444,72 @@ struct RootView: View {
                 }
             }
             .padding(6)
+        }
+    }
+
+    private var engineRow: some View {
+        FieldRow(label: "Состояние", help: engineHelp) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(engineColor)
+                    .frame(width: 7, height: 7)
+
+                Text(runner.engine.state.title)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+
+                if runner.engine.residentMegabytes > 1 {
+                    Text(String(format: "· %.1f ГБ в памяти", runner.engine.residentMegabytes / 1024))
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(runner.engine.isWarm ? Color.green : Color.secondary)
+                        .monospacedDigit()
+                }
+
+                Spacer()
+
+                if runner.engine.state == .stopped {
+                    Button {
+                        runner.engine.start(model.s)
+                    } label: {
+                        Image(systemName: "bolt.fill")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Запустить sd-server и держать веса модели в памяти")
+                } else {
+                    Button {
+                        runner.shutdownEngine()
+                    } label: {
+                        Image(systemName: "xmark.circle")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(runner.isRunning)
+                    .help("Остановить sd-server и выгрузить 14.6 ГБ весов из памяти")
+                }
+            }
+        }
+    }
+
+    private var engineColor: Color {
+        switch runner.engine.state {
+        case .stopped: return Color.secondary
+        case .starting: return Color.orange
+        case .ready: return runner.engine.isWarm ? Color.green : Color.yellow
+        case .failed: return Color.red
+        }
+    }
+
+    private var engineHelp: String {
+        switch runner.engine.state {
+        case .stopped:
+            return "Движок не запущен. Веса модели в памяти нет — первая генерация прочитает 14.6 ГБ с диска."
+        case .starting:
+            return "Идёт чтение весов. Это происходит один раз: дальше sd-server держит модель в памяти и повторные генерации её не перечитывают."
+        case .ready:
+            return runner.engine.isWarm
+                ? "sd-server работает, 14.6 ГБ весов держатся в памяти. Следующая генерация начнётся сразу, без чтения модели с диска."
+                : "sd-server работает. Модель будет прочитана при первой генерации и останется в памяти."
+        case .failed(let why):
+            return "Движок не работает: " + why
         }
     }
 
@@ -674,17 +742,12 @@ struct RootView: View {
                     }
                 }
 
-                FieldRow(label: "Превью, \(model.s.preview.rawValue) каждые \(model.s.previewInterval) \(GenerationSettings.stepsWord(model.s.previewInterval))", help: "Промежуточная картинка, чтобы не ждать вслепую. proj — мгновенно, но в 1/16 разрешения: видно только крупные пятна. tae и vae дают честную картинку, но на этой модели декод занимает 10-40 минут, так что для контроля они не годятся.") {
-                    HStack(spacing: 6) {
-                        Picker("", selection: s.preview) {
-                            ForEach(PreviewChoice.allCases) { Text($0.rawValue).tag($0) }
-                        }
-                        .labelsHidden()
-                        .frame(width: 110)
-                        Stepper("", value: s.previewInterval, in: 1...8)
-                            .labelsHidden()
-                            .help("Обновлять превью каждые N шагов")
-                    }
+                Divider()
+
+                FieldRow(label: "Промежуточное превью", help: "У sd-server нет превью: сервер отдаёт только готовый PNG. Пока идёт генерация, картинка появится в конце — за прогрессом следи по полосе и журналу.") {
+                    Label("не поддерживается сервером", systemImage: "xmark.circle")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
                 }
             }
             .padding(6)
@@ -718,7 +781,7 @@ struct RootView: View {
                     }
                 }
 
-                FieldRow(label: "Имя файла", help: "Без расширения — .png добавится сам. Превью всегда пишется рядом как preview.png и перезаписывается.") {
+                FieldRow(label: "Имя файла", help: "Без расширения — .png добавится сам. При batch больше одного к имени добавляется номер: имя-0.png, имя-1.png.") {
                     HStack(spacing: 6) {
                         TextField("output", text: s.outputName)
                             .textFieldStyle(.roundedBorder)
@@ -794,7 +857,27 @@ struct RootView: View {
                     .font(.system(size: 10, design: .monospaced))
                     .fixedSize(horizontal: false, vertical: true)
 
-                Text("Расчёт по замерам этой модели на CPU: 1085 с на шаг сэмплирования при 768×1024, декод ≈ 637 с. Реальное время сильно зависит от свободной памяти — при уходе в своп шаг становится в разы длиннее.")
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(model.s.stageWeights, id: \.stage) { w in
+                        HStack(spacing: 6) {
+                            Text(w.stage.rawValue)
+                                .font(.system(size: 9))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text(GenerationSettings.human(w.seconds))
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                            Text(String(format: "%.1f%%", w.weight * 100))
+                                .font(.system(size: 9, weight: .medium, design: .rounded))
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                                .frame(width: 38, alignment: .trailing)
+                        }
+                    }
+                }
+                .padding(.vertical, 2)
+
+                Text("Коэффициенты взяты из замеров этой модели на CPU: 1085 с на шаг при 768×1024, декод ≈ 638 с, кодирование ≈ 127 с + 1.34 с на токен, загрузка ≈ 168 с. Сэмплирование занимает больше 90% времени, поэтому полоса почти всё время идёт по нему — но как только sd-cli печатает реальную скорость шага, оценка пересчитывается по факту.")
                     .font(.system(size: 9))
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -852,14 +935,49 @@ struct RootView: View {
     }
 
     private var progressBar: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if let f = runner.progressFraction {
-                ProgressView(value: f)
-            } else if runner.isRunning {
-                ProgressView().progressViewStyle(.linear)
-            } else {
-                ProgressView(value: 0).opacity(0.25)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(runner.stage.rawValue)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(runner.stage == .failed ? Color.red : Color.primary)
+
+                if !runner.stepSummary.isEmpty {
+                    Text(runner.stepSummary)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Text(runner.percentText)
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(runner.stage == .failed ? Color.red : Color.accentColor)
+                    .contentTransition(.numericText())
+                    .help(runner.progressIsExact
+                          ? "Точно: sd-cli сообщает число выполненных шагов."
+                          : "Оценка по времени этой стадии; уточнится по факту.")
             }
+
+            segmentedBar
+
+            HStack(spacing: 10) {
+                if runner.isRunning {
+                    Label(
+                        "Прошло " + GenerationSettings.human(runner.lastElapsedSeconds),
+                        systemImage: "clock"
+                    )
+                }
+                if let eta = runner.etaSeconds {
+                    Label("осталось ≈ " + GenerationSettings.human(eta), systemImage: "hourglass")
+                }
+                Spacer()
+                Text(progressAccuracyHint)
+                    .foregroundStyle(.tertiary)
+            }
+            .font(.system(size: 9))
+            .foregroundStyle(.secondary)
+
             if !runner.exitMessage.isEmpty {
                 Text(runner.exitMessage)
                     .font(.system(size: 10))
@@ -870,6 +988,113 @@ struct RootView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
+    }
+
+    /// Полоса, разбитая на стадии: ширина сегмента = его доля в общем времени,
+    /// заливка внутри = выполненная часть этой стадии.
+    private var segmentedBar: some View {
+        let rows = runner.stageBreakdown.isEmpty
+            ? model.s.stageWeights.map { StageRow(
+                stage: $0.stage,
+                weight: $0.weight,
+                progress: 0,
+                seconds: $0.seconds,
+                state: .pending
+            ) }
+            : runner.stageBreakdown
+
+        return VStack(alignment: .leading, spacing: 4) {
+            GeometryReader { geo in
+                HStack(spacing: 1) {
+                    ForEach(rows) { row in
+                        segment(row, in: geo.size)
+                    }
+                }
+            }
+            .frame(height: 9)
+
+            ForEach(rows) { row in
+                stageLegendRow(row)
+            }
+        }
+    }
+
+    private func segment(_ row: StageRow, in size: CGSize) -> some View {
+        let width = max(2, size.width * row.weight)
+        return ZStack(alignment: .leading) {
+            Capsule()
+                .fill(Color.secondary.opacity(0.16))
+            Capsule()
+                .fill(segmentColor(row))
+                .frame(width: width * CGFloat(min(1, max(0, row.progress))))
+        }
+        .frame(width: width)
+        .help("\(row.title): \(row.weightText) от общего времени · \(row.secondsText)")
+    }
+
+    private func segmentColor(_ row: StageRow) -> Color {
+        switch row.state {
+        case .finished: return Color.accentColor.opacity(0.55)
+        case .running: return Color.accentColor
+        case .pending: return Color.accentColor.opacity(0.2)
+        }
+    }
+
+    private func stageLegendRow(_ row: StageRow) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: legendIcon(row.state))
+                .font(.system(size: 8))
+                .foregroundStyle(legendColor(row.state))
+                .frame(width: 10)
+
+            Text(row.title)
+                .font(.system(size: 9))
+                .foregroundStyle(row.state == .pending ? Color.secondary : Color.primary)
+
+            if !runner.stageBreakdown.isEmpty, row.state == .running {
+                Text("· \(Int(row.progress * 100))% внутри стадии")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            Text(row.secondsText)
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(.tertiary)
+
+            Text(row.weightText)
+                .font(.system(size: 9, weight: .medium, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(width: 34, alignment: .trailing)
+                .help("Доля стадии в общем времени генерации")
+        }
+    }
+
+    private func legendIcon(_ state: StageRow.State) -> String {
+        switch state {
+        case .pending: return "circle"
+        case .running: return "circle.lefthalf.filled"
+        case .finished: return "checkmark.circle.fill"
+        }
+    }
+
+    private func legendColor(_ state: StageRow.State) -> Color {
+        switch state {
+        case .pending: return Color.secondary
+        case .running: return Color.accentColor
+        case .finished: return Color.green
+        }
+    }
+
+    private var progressAccuracyHint: String {
+        if runner.stage == .done { return "готово" }
+        if runner.progressIsExact { return "точно по шагам" }
+        if runner.stage == .idle || runner.stage == .failed || runner.stage == .cancelled {
+            return "коэффициенты — из замеров этой модели на CPU"
+        }
+        return "оценка по времени стадии"
     }
 
     private var imageArea: some View {
@@ -889,15 +1114,6 @@ struct RootView: View {
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                } else if let img = runner.previewImage {
-                    Image(nsImage: img)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(maxHeight: geo.size.height * 0.72)
-                        .shadow(radius: 5)
-                    Text("Превью · шаг \(runner.stepsDone)/\(runner.stepsTotal) · \(model.s.preview.rawValue)")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
                 } else {
                     VStack(spacing: 10) {
                         Image(systemName: "photo.on.rectangle.angled")
@@ -905,7 +1121,7 @@ struct RootView: View {
                             .foregroundStyle(.tertiary)
                         Text("Здесь появится результат")
                             .foregroundStyle(.secondary)
-                        Text("первое превью — после первого шага сэмплирования")
+                        Text(runner.isRunning ? "генерация идёт — картинка появится в конце" : "картинка появится после генерации")
                             .font(.system(size: 10))
                             .foregroundStyle(.tertiary)
                     }

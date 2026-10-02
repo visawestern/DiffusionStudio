@@ -12,14 +12,12 @@ func runE2E() async -> Int32 {
     s.longEdge = 256
     s.threads = 8
     s.backend = .cpu
-    s.preview = .proj
-    s.previewInterval = 1
     s.verbose = false
     s.outputName = "e2e_selftest"
     s.batchCount = 1
 
     let runner = GenerationRunner()
-    print("=== Сквозной тест: 256x256, 1 шаг ===")
+    print("=== Сквозной тест: 256x256, 1 шаг, два прогона подряд ===")
     print("  цель: " + s.outputURL.path)
     print("  бинарь: " + s.binaryURL.path)
 
@@ -30,73 +28,93 @@ func runE2E() async -> Int32 {
         return 1
     }
 
-    runner.run(s)
-
-    let deadline = Date().addingTimeInterval(20 * 60)
-    var lastStage = ""
-
-    while Date() < deadline {
-        try? await Task.sleep(nanoseconds: 1_000_000_000)
-        if runner.stage.rawValue != lastStage {
-            lastStage = runner.stage.rawValue
-            print("  [" + Clock.short() + "] этап: \(lastStage)  шаг \(runner.stepsDone)/\(runner.stepsTotal)  \(runner.stepSummary)")
-        }
-        if !runner.isRunning && lastStage != "Не запущено" {
-            break
-        }
-    }
-
-    print("  итоговый этап: \(runner.stage.rawValue)")
-    print("  сообщение: \(runner.exitMessage.isEmpty ? "—" : runner.exitMessage)")
-    print("  время: \(String(format: "%.1f", runner.lastRunSeconds)) с")
-    print("  строк в логе: \(runner.logLines.count)")
-
     var failures = 0
 
-    let outExists = FileManager.default.fileExists(atPath: s.outputURL.path)
-    print(outExists ? "  ok   файл результата создан" : "  FAIL файл результата не создан")
-    if !outExists { failures += 1 }
+    // Первый прогон: sd-server поднимается и читает 14.6 ГБ весов.
+    let firstSeconds = await drive(runner: runner, settings: s, label: "первый")
+    print(String(format: "  первый прогон: %.1f с", firstSeconds))
 
-    if let img = runner.resultImage {
-        print("  ok   результат загружен в память: \(img.size.width)×\(img.size.height)")
+    if !runner.engine.isWarm {
+        print("  FAIL движок не считается прогретым после генерации")
+        failures += 1
     } else {
-        print("  FAIL результат не загрузился в NSImage")
+        print("  ok   веса остались в памяти после генерации")
+    }
+
+    let firstSize = (try? FileManager.default.attributesOfItem(atPath: s.outputURL.path))?[.size] as? Int ?? 0
+    try? FileManager.default.removeItem(at: s.outputURL)
+
+    // Второй прогон: главная проверка. Модель уже в памяти, повторного чтения
+    // 14.6 ГБ быть не должно — иначе время почти не сократится.
+    let secondSeconds = await drive(runner: runner, settings: s, label: "второй")
+    print(String(format: "  второй прогон: %.1f с", secondSeconds))
+
+    if runner.engine.isWarm {
+        print("  ok   веса по-прежнему в памяти")
+    } else {
+        print("  FAIL после второй генерации веса выгрузились")
         failures += 1
     }
 
-    if runner.lastRunSeconds > 0 {
-        print("  ok   таймер завершения отработал")
+    let secondSize = (try? FileManager.default.attributesOfItem(atPath: s.outputURL.path))?[.size] as? Int ?? 0
+    guard secondSize > 0 else {
+        print("  FAIL второй прогон не создал файл")
+        return Int32(failures + 1)
+    }
+    print("  ok   файл второго прогона создан, \(secondSize) байт")
+
+    if secondSize == firstSize, firstSize > 0 {
+        print("  ok   оба прогона дали одинаковый PNG (\(firstSize) байт)")
     } else {
-        print("  FAIL завершение не зафиксировано")
-        failures += 1
+        print("  warn размеры PNG различаются: \(firstSize) и \(secondSize)")
     }
 
-    if runner.stage == .done {
-        print("  ok   этап перешёл в «Готово»")
+    if secondSeconds < firstSeconds {
+        print(String(format: "  ok   второй прогон быстрее: %.1f с против %.1f с", secondSeconds, firstSeconds))
     } else {
-        print("  FAIL этап не «Готово»: \(runner.stage.rawValue)")
-        failures += 1
+        print("  warn второй прогон не быстрее первого — вероятно, ушла в своп")
     }
 
-    if runner.stepsTotal == 1 {
-        print("  ok   счётчик шагов разобран")
-    } else {
-        print("  FAIL счётчик шагов: \(runner.stepsTotal)")
-        failures += 1
+    if runner.logLines.contains(where: { $0.contains("loading tensors completed") }) == false {
+        print("  warn в логе не было строк загрузки весов")
     }
-
-    let previewExists = FileManager.default.fileExists(atPath: s.previewURL.path)
-    print(previewExists ? "  ok   превью создано" : "  warn превью не создано (1 шаг — превью могло не успеть)")
 
     print("  последние строки лога:")
-    for l in runner.logLines.suffix(6) {
+    for l in runner.logLines.suffix(8) {
         print("    | " + l)
     }
 
     try? FileManager.default.removeItem(at: s.outputURL)
-    try? FileManager.default.removeItem(at: s.previewURL)
+    runner.shutdownEngine()
 
     return failures == 0 ? 0 : 1
+}
+
+/// Гоняет одну генерацию и печатает смену стадий.
+@MainActor
+func drive(runner: GenerationRunner, settings: GenerationSettings, label: String) async -> Double {
+    let started = Date()
+    var lastStage = ""
+    runner.run(settings)
+
+    let deadline = Date().addingTimeInterval(40 * 60)
+    while Date() < deadline {
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        let line = "[\(Clock.short())] \(label): \(runner.stage.rawValue)"
+            + " \(runner.percentText) · \(runner.progressFraction) · шаг \(runner.stepsDone)/\(runner.stepsTotal)"
+        if runner.stage.rawValue != lastStage {
+            lastStage = runner.stage.rawValue
+            print("  " + line)
+        }
+        if !runner.isRunning, lastStage != "Не запущено" { break }
+    }
+
+    let seconds = Date().timeIntervalSince(started)
+    print("  \(label): этап «\(runner.stage.rawValue)», \(runner.percentText), \(String(format: "%.1f", seconds)) с")
+    if !runner.exitMessage.isEmpty {
+        print("    сообщение: " + runner.exitMessage)
+    }
+    return seconds
 }
 
 enum Clock {

@@ -23,6 +23,8 @@ swiftc \
   -target "${TARGET_ARCH}-apple-macosx${DEPLOY_TARGET}" \
   -o "${BUNDLE}/Contents/MacOS/DiffusionStudio" \
   Sources/Settings.swift \
+  Sources/Progress.swift \
+  Sources/EngineServer.swift \
   Sources/Runner.swift \
   Sources/Presets.swift \
   Sources/RootView.swift \

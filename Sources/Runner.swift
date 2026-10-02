@@ -1,18 +1,30 @@
 import AppKit
 import Foundation
 
-enum RunStage: String {
+enum RunStage: String, CaseIterable {
     case idle = "Не запущено"
     case loading = "Загрузка моделей"
     case encoding = "Кодирование промпта"
     case sampling = "Сэмплирование"
     case decoding = "Декодирование (VAE)"
+    case saving = "Сохранение"
     case done = "Готово"
     case failed = "Ошибка"
     case cancelled = "Отменено"
+
+    /// Стадии, которые реально проходит пайплайн, в порядке выполнения.
+    /// `idle/done/failed/cancelled` — терминальные состояния, в бюджет не входят.
+    static let pipeline: [RunStage] = [.loading, .encoding, .sampling, .decoding, .saving]
+
+    var isPipelineStage: Bool { RunStage.pipeline.contains(self) }
+
+    /// Порядковый номер стадии в пайплайне; -1 для терминальных.
+    var pipelineIndex: Int { RunStage.pipeline.firstIndex(of: self) ?? -1 }
 }
 
 private let barStep = try? NSRegularExpression(pattern: "(\\d+)/(\\d+)\\s*-\\s*([0-9]+(?:\\.[0-9]+)?)(s/it|it/s)")
+private let tokenCountRE = try? NSRegularExpression(pattern: "to\\s+(\\d+)\\s+tokens")
+private let tookSecondsRE = try? NSRegularExpression(pattern: "taking\\s+([0-9]+(?:\\.[0-9]+)?)s")
 
 @MainActor
 final class GenerationRunner: ObservableObject {
@@ -24,25 +36,86 @@ final class GenerationRunner: ObservableObject {
     @Published var stepsTotal: Int = 0
     @Published var secondsPerStep: Double = 0
     @Published var isRunning = false
-    @Published var previewImage: NSImage?
     @Published var resultImage: NSImage?
     @Published var exitMessage: String = ""
     @Published var lastRunSeconds: Double = 0
 
-    var progressFraction: Double? {
-        if stage == .sampling, stepsTotal > 0 {
-            return Double(stepsDone) / Double(stepsTotal)
+    /// Бюджет времени по стадиям для текущего запуска. Пересобирается, как
+    /// только появляются фактические замеры из лога.
+    @Published private(set) var budget: StageBudget?
+
+    /// Сколько секунд прошло внутри текущей стадии — им меряется прогресс
+    /// стадий, для которых `sd-cli` не даёт точного счётчика.
+    @Published private(set) var stageElapsed: Double = 0
+
+    /// Итоговая доля выполненной работы, 0...1. Никогда не уменьшается.
+    @Published private(set) var fraction: Double = 0
+
+    /// Метка точности: точно (счётчик шагов), по оценке (время) или финал.
+    var progressIsExact: Bool { stage == .sampling || stage == .done }
+
+    private var highestFraction: Double = 0
+    private var stageStartedAt: Date?
+
+    // Калибровка бюджета фактическими замерами из лога. Видна наружу, чтобы
+    // selftest мог проверить, что парсер действительно подхватил значения.
+    private(set) var promptTokens: Int?
+    private(set) var measuredLoading: Double?
+    private(set) var measuredEncoding: Double?
+    private(set) var measuredDecoding: Double?
+    private var completedStages: Set<RunStage> = []
+
+    /// Общий прогресс работы над картинкой: веса пройденных стадий плюс
+    /// прогресс внутри текущей.
+    var progressFraction: Double {
+        guard let budget, stage.isPipelineStage else {
+            return stage == .done ? 1.0 : fraction
         }
-        if stage == .loading || stage == .encoding || stage == .decoding { return nil }
-        if stage == .done { return 1.0 }
-        return nil
+        let weight = budget.weight(of: stage)
+        let within = stageFraction
+        let raw = budget.offset(of: stage) + weight * within
+        return min(1, max(highestFraction, raw))
     }
 
+    /// Доля выполнения внутри текущей стадии, 0...1.
+    var stageFraction: Double {
+        switch stage {
+        case .sampling:
+            return stepsTotal > 0 ? min(1, Double(stepsDone) / Double(stepsTotal)) : 0
+        case .loading, .encoding, .decoding, .saving:
+            guard let budget else { return 0 }
+            let planned = budget.seconds(for: stage)
+            guard planned > 0 else { return 0 }
+            return min(1, stageElapsed / planned)
+        case .idle, .done, .failed, .cancelled:
+            return stage == .done ? 1 : 0
+        }
+    }
+
+    /// Сколько примерно осталось до конца генерации.
     var etaSeconds: Double? {
-        guard stage == .sampling, stepsTotal > 0, secondsPerStep > 0 else { return nil }
-        let remaining = max(0, stepsTotal - stepsDone)
-        guard remaining > 0 else { return nil }
-        return Double(remaining) * secondsPerStep
+        guard isRunning, let budget, stage.isPipelineStage else { return nil }
+        var remaining = 0.0
+        for candidate in RunStage.pipeline {
+            if completedStages.contains(candidate) { continue }
+            let planned = budget.seconds(for: candidate)
+            if candidate == stage {
+                remaining += planned * (1 - stageFraction)
+            } else if candidate.pipelineIndex > stage.pipelineIndex {
+                remaining += planned
+            }
+        }
+        return remaining > 0 ? remaining : nil
+    }
+
+    var percentText: String {
+        String(format: "%.1f%%", progressFraction * 100)
+    }
+
+    /// Сколько секунд идёт генерация целиком.
+    var lastElapsedSeconds: Double {
+        guard let startedAt = startedAt else { return lastRunSeconds }
+        return isRunning ? Date().timeIntervalSince(startedAt) : lastRunSeconds
     }
 
     var stepSummary: String {
@@ -58,9 +131,38 @@ final class GenerationRunner: ObservableObject {
         return "осталось ≈ " + GenerationSettings.human(eta)
     }
 
-    private var process: Process?
-    private var outPipe: Pipe?
-    private var errPipe: Pipe?
+    /// Разбивка по стадиям для панели прогресса: вес, доля и текст времени.
+    var stageBreakdown: [StageRow] {
+        guard let budget else { return [] }
+        let index = stage.pipelineIndex
+        return RunStage.pipeline.map { s in
+            let weight = budget.weight(of: s)
+            let progress: Double
+            if completedStages.contains(s) {
+                progress = 1
+            } else if s == stage {
+                progress = stageFraction
+            } else if index >= 0, s.pipelineIndex < index {
+                progress = 1
+            } else {
+                progress = 0
+            }
+            return StageRow(
+                stage: s,
+                weight: weight,
+                progress: progress,
+                seconds: budget.seconds(for: s),
+                state: completedStages.contains(s) ? .finished
+                    : (s == stage ? .running : .pending)
+            )
+        }
+    }
+
+    /// Долгоживущий локальный движок: держит веса модели в памяти между
+    /// генерациями, поэтому вторая картинка не читает 14.6 ГБ заново.
+    let engine = EngineServer()
+
+    private var generationTask: Task<Void, Never>?
     private var pollTimer: Timer?
     private var startedAt: Date?
 
@@ -79,6 +181,29 @@ final class GenerationRunner: ObservableObject {
 
     func isBusy() -> Bool { isRunning }
 
+    /// Сброс состояния отслеживания прогресса перед стартом.
+    func beginTracking(_ settings: GenerationSettings) {
+        stage = .loading
+        currentSettings = settings
+        stepsDone = 0
+        stepsTotal = settings.steps
+        secondsPerStep = 0
+        resultImage = nil
+        exitMessage = ""
+        startedAt = Date()
+        lastRunSeconds = 0
+        promptTokens = nil
+        measuredLoading = nil
+        measuredEncoding = nil
+        measuredDecoding = nil
+        completedStages = []
+        stageStartedAt = Date()
+        highestFraction = 0
+        fraction = 0
+        stageElapsed = 0
+        budget = StageBudget.projected(settings: settings)
+    }
+
     func run(_ settings: GenerationSettings) {
         guard !isRunning else { return }
         let problems = settings.problems
@@ -89,63 +214,100 @@ final class GenerationRunner: ObservableObject {
             return
         }
 
-        let args = settings.buildArguments()
-        currentSettings = settings
         lastKnownOutput = settings.outputURL
         logLines.removeAll()
-        append("$ build/bin/sd-cli " + args.joined(separator: " "))
+        append("$ " + requestDescription(settings))
 
-        let proc = Process()
-        proc.executableURL = settings.binaryURL
-        proc.arguments = args
-        proc.currentDirectoryURL = URL(fileURLWithPath: settings.rootPath)
-
-        let outPipe = Pipe()
-        let errPipe = Pipe()
-        proc.standardOutput = outPipe
-        proc.standardError = errPipe
-
-        stage = .loading
         isRunning = true
-        stepsDone = 0
-        stepsTotal = settings.steps
-        secondsPerStep = 0
-        previewImage = nil
-        resultImage = nil
-        exitMessage = ""
-        startedAt = Date()
-        lastRunSeconds = 0
+        beginTracking(settings)
 
-        let collector = LineCollector { [weak self] line in
+        engine.onLine = { [weak self] line in
             Task { @MainActor in self?.consume(line) }
         }
 
-        outPipe.fileHandleForReading.readabilityHandler = { h in
-            collector.feed(h.availableData)
-        }
-        errPipe.fileHandleForReading.readabilityHandler = { h in
-            collector.feed(h.availableData)
-        }
-
-        do {
-            try proc.run()
-            process = proc
-            self.outPipe = outPipe
-            self.errPipe = errPipe
-            startPolling()
-        } catch {
-            isRunning = false
-            stage = .failed
-            exitMessage = "Не удалось запустить: \(error.localizedDescription)"
-            append("! " + exitMessage)
+        generationTask = Task { @MainActor [weak self] in
+            await self?.performRun(settings)
         }
     }
 
+    private func requestDescription(_ s: GenerationSettings) -> String {
+        let size = s.resolvedSize
+        return "sd-server POST /sdcpp/v1/img_gen "
+            + "\(size.width)x\(size.height) · \(s.steps) \(GenerationSettings.stepsWord(s.steps)) · "
+            + "\(s.sampler.rawValue) · seed \(s.randomSeed ? -1 : s.seed)"
+    }
+
+    private func performRun(_ settings: GenerationSettings) async {
+        do {
+            let wasWarm = engine.isWarm
+            try await engine.ensureReady(settings)
+            if wasWarm {
+                // Ключевая экономия: веса уже в памяти, повторного чтения
+                // 14.6 ГБ не будет — стадия загрузки вырождается в ноль.
+                measuredLoading = 0
+                recomputeBudget()
+            } else {
+                append("— первый запуск: веса читаются с диска, дальше останутся в памяти —")
+            }
+
+            let images = try await engine.generate(settings) { [weak self] message in
+                self?.append("  " + message)
+            }
+
+            try write(images: images, settings: settings)
+            finishAllStages()
+            isRunning = false
+            stopPolling()
+        } catch is CancellationError {
+            isRunning = false
+            stage = .cancelled
+            append("— генерация отменена —")
+        } catch {
+            isRunning = false
+            stage = .failed
+            exitMessage = error.localizedDescription
+            append("! " + error.localizedDescription)
+        }
+    }
+
+    /// `sd-server` возвращает готовые PNG внутри ответа и файлы не пишет —
+    /// сохраняет их приложение.
+    private func write(images: [GeneratedImage], settings: GenerationSettings) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(
+            at: URL(fileURLWithPath: settings.resolvedOutputDirectory),
+            withIntermediateDirectories: true
+        )
+        let single = images.count == 1
+        for image in images {
+            let target = single ? settings.outputURL : batchURL(settings, image.index)
+            try image.data.write(to: target, options: .atomic)
+            append("— сохранено: " + target.path)
+        }
+        lastKnownOutput = images.count == 1 ? settings.outputURL : batchURL(settings, 0)
+        if let img = NSImage(data: images[0].data) {
+            resultImage = img
+        }
+    }
+
+    private func batchURL(_ settings: GenerationSettings, _ index: Int) -> URL {
+        URL(fileURLWithPath: settings.resolvedOutputDirectory)
+            .appendingPathComponent("\(settings.outputName)-\(index).png")
+    }
+
     func cancel() {
-        guard let proc = process, proc.isRunning else { return }
+        guard isRunning else { return }
         append("— отмена по запросу —")
-        proc.terminate()
+        generationTask?.cancel()
+        Task { @MainActor in
+            await engine.cancel()
+        }
         stage = .cancelled
+    }
+
+    /// Останавливает движок и выгружает веса из памяти.
+    func shutdownEngine() {
+        engine.stop()
     }
 
     func runEnvironmentCheck() {
@@ -188,28 +350,138 @@ final class GenerationRunner: ObservableObject {
 
     var lastKnownOutput: URL = URL(fileURLWithPath: AppConstants.defaultRoot).appendingPathComponent("outputs")
 
-    private func consume(_ raw: String) {
+    /// Разбор одной строки вывода. Внутренний, чтобы его можно было прогнать
+    /// в selftest на реальных строках лога.
+    func consume(_ raw: String) {
         append(raw)
 
         let lower = raw.lowercased()
 
-        if lower.contains("generate_image ") {
-            stage = .encoding
-        }
-        if lower.contains("get_learned_condition completed") {
-            stage = .sampling
-        }
-        if lower.contains("sampling completed") || lower.contains("decoding vae") || lower.contains("vae decode graph") {
-            if stage == .sampling || stage == .loading { stage = .decoding }
-        }
-        if lower.contains("save result image") {
-            stage = .done
-        }
         if lower.contains("[error") {
             exitMessage = raw.trimmingCharacters(in: .whitespaces)
         }
 
+        parseMeasurements(from: raw)
+        advanceStage(from: raw)
         applyProgress(from: raw)
+    }
+
+    /// Вытаскивает из лога то, что можно использовать как калибровку бюджета:
+    /// число токенов промпта и фактическое время завершившихся стадий.
+    private func parseMeasurements(from line: String) {
+        let range = NSRange(line.startIndex..., in: line)
+
+        if let m = tokenCountRE?.firstMatch(in: line, range: range),
+           let text = capture(m, at: 1, in: line),
+           let tokens = Int(text), promptTokens == nil {
+            promptTokens = tokens
+            recomputeBudget()
+        }
+
+        let took = tookSecondsRE?.firstMatch(in: line, range: range)
+            .flatMap { capture($0, at: 1, in: line) }
+            .flatMap { Double($0) }
+
+        // `loading tensors completed` приходит трижды: энкодер, диффузия, VAE.
+        if normalized(line).contains("loading tensors completed"), let took {
+            measuredLoading = (measuredLoading ?? 0) + took
+            if stage == .decoding || stage == .saving { recomputeBudget() }
+        }
+        if normalized(line).contains("get_learned_condition completed"), let took {
+            measuredEncoding = took
+            recomputeBudget()
+        }
+        if normalized(line).contains("decoded, taking") && !normalized(line).contains("get_learned"), let took {
+            measuredDecoding = took
+            recomputeBudget()
+        }
+    }
+
+    /// Переходы между стадиями строго по порядку пайплайна: назад полоса не
+    /// откатывается даже если строки в логе перемешались.
+    private func advanceStage(from line: String) {
+        let lower = normalized(line)
+        let target: RunStage?
+
+        if lower.contains("images saved") || lower.contains("generate_image completed") {
+            target = .done
+        } else if lower.contains("generate_image ") || lower.contains("llm_encode") || lower.contains("clip_encode") {
+            target = .encoding
+        } else if lower.contains("get_learned_condition completed") || lower.contains("sampling using ") {
+            target = .sampling
+        } else if lower.contains("sampling completed") || lower.contains("decoding vae") || lower.contains("vae decode graph") {
+            target = .decoding
+        } else if lower.contains("save result image") {
+            target = .saving
+        } else {
+            target = nil
+        }
+
+        guard let target else { return }
+        if target == .done {
+            finishAllStages()
+            return
+        }
+        guard target.pipelineIndex > stage.pipelineIndex || (target == stage) else { return }
+        enterStage(target)
+    }
+
+    private func normalized(_ line: String) -> String { line.lowercased() }
+
+    private func enterStage(_ next: RunStage) {
+        if stage.isPipelineStage, !completedStages.contains(stage) {
+            let spent = Date().timeIntervalSince(stageStartedAt ?? Date())
+            recordActual(stage, seconds: spent)
+        }
+        stage = next
+        stageStartedAt = Date()
+        stageElapsed = 0
+    }
+
+    /// После завершения стадии подставляем её реальную длительность в бюджет,
+    /// чтобы последующие стадии оценивались по факту, а не по модели.
+    private func recordActual(_ s: RunStage, seconds: Double) {
+        completedStages.insert(s)
+        switch s {
+        case .loading: if measuredLoading == nil { measuredLoading = seconds }
+        case .encoding: if measuredEncoding == nil { measuredEncoding = seconds }
+        case .decoding: if measuredDecoding == nil { measuredDecoding = seconds }
+        default: break
+        }
+        recomputeBudget()
+        updateFraction()
+    }
+
+    private func finishAllStages() {
+        if stage.isPipelineStage, !completedStages.contains(stage) {
+            let spent = Date().timeIntervalSince(stageStartedAt ?? Date())
+            recordActual(stage, seconds: spent)
+        }
+        for s in RunStage.pipeline { completedStages.insert(s) }
+        stage = .done
+        stageStartedAt = nil
+        stageElapsed = 0
+        highestFraction = 1
+        fraction = 1
+    }
+
+    private func recomputeBudget() {
+        guard let settings = currentSettings else { return }
+        budget = StageBudget.projected(
+            settings: settings,
+            promptTokens: promptTokens,
+            measuredStepSeconds: secondsPerStep > 0 ? secondsPerStep : nil,
+            measuredLoading: measuredLoading,
+            measuredEncoding: measuredEncoding,
+            measuredDecoding: measuredDecoding
+        )
+    }
+
+    private func updateFraction() {
+        guard let budget, stage.isPipelineStage else { return }
+        let raw = budget.offset(of: stage) + budget.weight(of: stage) * stageFraction
+        highestFraction = max(highestFraction, min(1, raw))
+        fraction = highestFraction
     }
 
     private func applyProgress(from line: String) {
@@ -238,12 +510,19 @@ final class GenerationRunner: ObservableObject {
 
     private func startPolling() {
         stopPolling()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.detectCompletion()
-                self?.refreshImages()
+                self?.tick()
             }
         }
+    }
+
+    private func tick() {
+        guard isRunning else { return }
+        if let stageStartedAt = stageStartedAt {
+            stageElapsed = Date().timeIntervalSince(stageStartedAt)
+        }
+        updateFraction()
     }
 
     private func stopPolling() {
@@ -251,42 +530,7 @@ final class GenerationRunner: ObservableObject {
         pollTimer = nil
     }
 
-    private func refreshImages() {
-        guard let settings = currentSettings else { return }
-        lastKnownOutput = settings.outputURL
 
-        let preview = settings.previewURL
-        if let img = NSImage(contentsOf: preview) {
-            previewImage = img
-        }
-        if stage == .done || FileManager.default.fileExists(atPath: settings.outputURL.path) {
-            if let img = NSImage(contentsOf: settings.outputURL) {
-                resultImage = img
-                stage = .done
-            }
-        }
-    }
-
-    private func detectCompletion() {
-        guard isRunning, let proc = process, !proc.isRunning else { return }
-        let status = proc.terminationStatus
-        isRunning = false
-        process = nil
-        if let o = outPipe { o.fileHandleForReading.readabilityHandler = nil }
-        if let e = errPipe { e.fileHandleForReading.readabilityHandler = nil }
-        outPipe = nil
-        errPipe = nil
-        stopPolling()
-        if let startedAt = startedAt {
-            lastRunSeconds = Date().timeIntervalSince(startedAt)
-        }
-        refreshImages()
-        if status != 0 && stage != .done {
-            stage = .failed
-            exitMessage = "sd-cli завершился с кодом \(status)"
-        }
-        append("— процесс завершён, код \(status) —")
-    }
 
     var currentSettings: GenerationSettings?
 }
