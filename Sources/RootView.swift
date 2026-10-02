@@ -49,13 +49,6 @@ final class SettingsModel: ObservableObject {
         persist()
     }
 
-    func chooseRootDirectory() {
-        if let url = FolderPicker.pick(title: "Папка со stable-diffusion.cpp", start: s.rootPath) {
-            s.rootPath = url.path
-            normalize()
-        }
-    }
-
     func chooseOutputDirectory() {
         if let url = FolderPicker.pick(title: "Куда сохранять картинки", start: s.resolvedOutputDirectory) {
             s.outputDirectory = url.path
@@ -371,18 +364,12 @@ struct RootView: View {
             .help("Выбрать папку, куда будут сохраняться картинки")
 
             Button {
-                model.chooseRootDirectory()
-            } label: {
-                Image(systemName: "wrench.and.screwdriver")
-            }
-            .help("Указать папку, где собран stable-diffusion.cpp и лежат модели")
-
-            Button {
+                model.ensureOutputDirectory()
                 NSWorkspace.shared.activateFileViewerSelecting([model.s.outputURL])
             } label: {
                 Image(systemName: "folder")
             }
-            .help("Показать результат в Finder")
+            .help("Открыть папку с сохранёнными картинками в Finder")
 
             Divider().frame(height: 18)
 
@@ -432,14 +419,13 @@ struct RootView: View {
                     .labelsHidden()
                 }
 
-                FieldRow(label: "Папка движка", help: "Корень stable-diffusion.cpp. Нужен, чтобы найти build/bin/sd-cli и папку models. По умолчанию — собранный проект в /var/folders/...") {
-                    HStack(spacing: 6) {
-                        TextField("путь к stable-diffusion.cpp", text: s.rootPath)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(size: 10, design: .monospaced))
-                        Button("Выбрать") { model.chooseRootDirectory() }
-                            .controlSize(.small)
-                    }
+                FieldRow(label: "Движок", help: "Папка со stable-diffusion.cpp фиксирована: здесь лежат build/bin/sd-cli и папка models. Менять её не нужно — выбирается только папка для сохранения картинок. Если переносите движок, задайте переменную окружения DIFFUSION_STUDIO_ROOT.") {
+                    Text(model.s.rootPath)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
                 }
 
                 if model.s.modelSet == .qwenImage21Q6 {

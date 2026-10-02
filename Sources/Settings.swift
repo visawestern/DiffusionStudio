@@ -1,13 +1,16 @@
 import Foundation
 
 enum AppConstants {
-    /// Папка stable-diffusion.cpp, если она не задана явно.
+    /// Папка stable-diffusion.cpp. В интерфейсе она не меняется: движок лежит
+    /// в фиксированном месте, и трогать его не нужно.
     ///
-    /// Порядок: переменная окружения `DIFFUSION_STUDIO_ROOT`, затем несколько
-    /// типовых мест установки, иначе пустая строка — тогда пользователь должен
-    /// выбрать папку кнопкой в интерфейсе. Выбранный путь сохраняется в
-    /// UserDefaults, поэтому достаточно указать его один раз.
+    /// Порядок поиска: переменная окружения `DIFFUSION_STUDIO_ROOT`, затем
+    /// локальная сборка, затем типовые места установки.
     static let defaultRoot: String = resolveRoot()
+
+    /// Локальная сборка движка. Если stable-diffusion.cpp переехал, проще
+    /// задать DIFFUSION_STUDIO_ROOT, чем добавлять новый путь сюда.
+    static let localBuild = "/var/folders/cn/mx7g770j6j17g7kvkb6wlfhw0000gp/T/opencode/stable-diffusion.cpp"
 
     private static func resolveRoot() -> String {
         if let env = ProcessInfo.processInfo.environment["DIFFUSION_STUDIO_ROOT"],
@@ -16,6 +19,7 @@ enum AppConstants {
         }
         let home = NSHomeDirectory()
         let candidates = [
+            localBuild,
             home + "/stable-diffusion.cpp",
             home + "/Developer/stable-diffusion.cpp",
             home + "/src/stable-diffusion.cpp",
@@ -28,7 +32,7 @@ enum AppConstants {
         let fm = FileManager.default
         return candidates.first { fm.fileExists(atPath: $0 + "/build/bin/sd-cli") }
             ?? candidates.first { fm.fileExists(atPath: $0) }
-            ?? ""
+            ?? localBuild
     }
 
     /// Имя бинарника `sd-cli` относительно корня движка.
