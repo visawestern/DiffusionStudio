@@ -220,6 +220,7 @@ final class GenerationRunner: ObservableObject {
 
         isRunning = true
         beginTracking(settings)
+        startPolling()
 
         engine.onLine = { [weak self] line in
             Task { @MainActor in self?.consume(line) }
@@ -238,6 +239,7 @@ final class GenerationRunner: ObservableObject {
     }
 
     private func performRun(_ settings: GenerationSettings) async {
+        defer { stopPolling() }
         do {
             let wasWarm = engine.isWarm
             try await engine.ensureReady(settings)
@@ -257,7 +259,6 @@ final class GenerationRunner: ObservableObject {
             try write(images: images, settings: settings)
             finishAllStages()
             isRunning = false
-            stopPolling()
         } catch is CancellationError {
             isRunning = false
             stage = .cancelled

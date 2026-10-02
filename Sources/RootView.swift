@@ -134,6 +134,26 @@ struct LogSidebar: View {
     }
 }
 
+struct BusyIndicator: View {
+    let isBusy: Bool
+
+    var body: some View {
+        if isBusy {
+            HStack(spacing: 6) {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .controlSize(.small)
+                Text("идёт")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Генерация выполняется")
+            .help("Задача выполняется: даже если журнал и проценты пока не двигаются, сервер может читать веса или считать текущий шаг.")
+        }
+    }
+}
+
 struct RootView: View {
     @StateObject private var model = SettingsModel()
     @StateObject private var runner = GenerationRunner()
@@ -626,6 +646,7 @@ struct RootView: View {
     private var progressBar: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
+                BusyIndicator(isBusy: runner.isRunning)
                 Text(runner.stage.rawValue)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(runner.stage == .failed ? Color.red : Color.primary)
