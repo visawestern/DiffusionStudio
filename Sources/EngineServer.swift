@@ -289,7 +289,7 @@ final class EngineServer: ObservableObject {
         var request = URLRequest(url: baseURL.appendingPathComponent("sdcpp/v1/img_gen"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 60
+        request.timeoutInterval = 600
         request.httpBody = try JSONSerialization.data(withJSONObject: Self.requestBody(settings))
 
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -310,53 +310,107 @@ final class EngineServer: ObservableObject {
         return try await waitForJob(jobId, progress: progress)
     }
 
-    private func waitForJob(_ jobId: String, progress: @escaping @MainActor (String) -> Void) async throws -> [GeneratedImage] {
+private func waitForJob(_ jobId: String, progress: @escaping @MainActor (String) -> Void) async throws -> [GeneratedImage] {
         let pollURL = baseURL.appendingPathComponent("sdcpp/v1/jobs/\(jobId)")
         let deadline = Date().addingTimeInterval(6 * 60 * 60)
+        var stalls = 0
 
         while Date() < deadline {
             if Task.isCancelled {
                 await cancel(jobId: jobId)
                 throw CancellationError()
             }
-            var request = URLRequest(url: pollURL)
-            request.timeoutInterval = 15
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-                throw EngineError.badResponse("Опрос задачи вернул \((response as? HTTPURLResponse)?.statusCode ?? -1)")
+            guard process != nil else {
+                activeJobId = nil
+                throw EngineError.jobFailed("sd-server остановился во время генерации")
             }
-            guard let payload = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                throw EngineError.badResponse("Ответ опроса не разобран")
-            }
-            sampleResidentMemory()
 
-            switch payload["status"] as? String {
-            case "completed":
+            let outcome: PollOutcome
+            do {
+                outcome = try await pollOnce(pollURL, jobId: jobId)
+                stalls = 0
+            } catch {
+                // Сервер не отвечает, пока читает 14.6 ГБ весов с диска и пока
+                // считает conditioning. Это занятость, а не поломка задачи: рвать
+                // генерацию здесь нельзя, сервер всё равно продолжает считать.
+                stalls += 1
+                progress("сервер занят, опрос не прошёл (\(stalls))")
+                if stalls >= 6 {
+                    await cancel(jobId: jobId)
+                    throw EngineError.jobFailed("Сервер не ответил на опрос \(stalls) раз подряд")
+                }
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                continue
+            }
+
+            switch outcome {
+            case .completed(let images):
                 activeJobId = nil
                 isWarm = true
-                return try Self.extractImages(payload)
-
-            case "failed", "cancelled":
+                return images
+            case .failed(let why):
                 activeJobId = nil
-                throw EngineError.jobFailed(Self.describeError(payload))
-
-            default:
-                let position = payload["queue_position"] as? Int ?? 0
-                if position > 0 {
-                    progress("задача в очереди, позиция \(position)")
+                throw EngineError.jobFailed(why)
+            case .running(let queuePosition):
+                sampleResidentMemory()
+                if queuePosition > 0 {
+                    progress("задача в очереди, позиция \(queuePosition)")
                 }
             }
             try? await Task.sleep(nanoseconds: 1_000_000_000)
         }
         activeJobId = nil
+        await cancel(jobId: jobId)
         throw EngineError.jobFailed("Таймаут ожидания задачи")
+    }
+
+    private enum PollOutcome {
+        case completed([GeneratedImage])
+        case failed(String)
+        case running(Int)
+    }
+
+    /// Один опрос задачи.
+    ///
+    /// Таймаут большой намеренно: `sd-server` не отвечает на HTTP, пока читает
+    /// веса с диска (первый запуск — больше двух минут) и пока считает
+    /// conditioning длинного промпта (замер — 313 секунд). Короткий таймаут
+    /// рвал генерацию, хотя сервер продолжал считать впустую.
+    private func pollOnce(_ url: URL, jobId: String) async throws -> PollOutcome {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 600
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        guard let http = response as? HTTPURLResponse else {
+            throw EngineError.badResponse("Ответ без HTTP-кода")
+        }
+        // Задача исчезла из сервера: либо её выкинул рестарт, либо срок её жизни
+        // истёк. Дальше опрашивать бессмысленно.
+        if http.statusCode == 404 || http.statusCode == 410 {
+            throw EngineError.jobFailed("Сервер больше не знает задачу \(jobId)")
+        }
+        guard http.statusCode == 200 else {
+            throw EngineError.badResponse(Self.describe(http: http, data: data))
+        }
+        guard let payload = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw EngineError.badResponse("Ответ опроса не разобран")
+        }
+
+        switch payload["status"] as? String {
+        case "completed":
+            return .completed(try Self.extractImages(payload))
+        case "failed", "cancelled":
+            return .failed(Self.describeError(payload))
+        default:
+            return .running(payload["queue_position"] as? Int ?? 0)
+        }
     }
 
     func cancel(jobId: String? = nil) async {
         guard let id = jobId ?? activeJobId else { return }
         var request = URLRequest(url: baseURL.appendingPathComponent("sdcpp/v1/jobs/\(id)/cancel"))
         request.httpMethod = "POST"
-        request.timeoutInterval = 10
+        request.timeoutInterval = 30
         _ = try? await URLSession.shared.data(for: request)
         activeJobId = nil
         append("— отмена задачи \(id) —")

@@ -19,7 +19,6 @@ s.rootPath = "/tmp/root"
 s.prompt = "test prompt"
 s.negativePrompt = ""
 s.aspect = .square
-s.longEdge = 512
 s.steps = 8
 s.cfgScale = 2.5
 s.flowShift = 3.0
@@ -70,14 +69,13 @@ s.negativePrompt = "blurry"
 s.cfgScale = 7.0
 s.sampler = .dpmPP2m
 s.vaeTiling = true
-s.aspect = .a4
-s.longEdge = 1024
+s.aspect = .landscape169
 let body2 = EngineServer.requestBody(s)
 print("  " + (String(data: try JSONSerialization.data(withJSONObject: body2), encoding: .utf8) ?? ""))
 check("random seed = -1", (body2["seed"] as? Int) == -1)
 check("negative prompt передан", body2["negative_prompt"] as? String == "blurry")
 check("смена сэмплера", (body2["sample_params"] as? [String: Any])?["sample_method"] as? String == "dpm++2m")
-check("A4 даёт 1024x1408", (body2["width"] as? Int) == 1024 && (body2["height"] as? Int) == 1408)
+check("16:9 даёт 1344x768", (body2["width"] as? Int) == 1344 && (body2["height"] as? Int) == 768)
 check("тайлинг включён флагом", ((body2["vae_tiling_params"] as? [String: Any])?["enabled"] as? Bool) == true)
 
 print("=== 1b. Отпечаток запуска движка ===")
@@ -96,11 +94,36 @@ var s5 = s
 s5.vaeTiling = !s.vaeTiling
 check("смена тайлинга меняет отпечаток", EngineServer.launchFingerprint(s5) != fpA)
 
-print("=== 2. Размеры по пресетам ===")
+print("=== 2. Размеры: только те, на которых модель обучалась ===")
+let trained: [AspectPreset: (Int, Int)] = [
+    .square: (1024, 1024),
+    .landscape43: (1024, 768),
+    .portrait34: (768, 1024),
+    .landscape169: (1344, 768),
+    .portrait916: (768, 1344),
+]
+
+check("набор размеров совпадает с обучающими", Set(AspectPreset.allCases) == Set(trained.keys))
+
 for preset in AspectPreset.allCases {
-    let size = preset.size(for: 512)
-    print(String(format: "  %@ → %d x %d", preset.label, size.0, size.1))
-    check("\(preset.label) кратен 64", size.0 % 64 == 0 && size.1 % 64 == 0)
+    let size = preset.size
+    let expected = trained[preset]!
+    print(String(format: "  %@ → %d x %d", preset.rawValue, size.width, size.height))
+    check("\(preset.rawValue) ровно обучающий размер",
+          size.width == expected.0 && size.height == expected.1)
+    check("\(preset.rawValue) кратен 64 по обеим сторонам",
+          size.width % 64 == 0 && size.height % 64 == 0)
+    check("\(preset.rawValue) помещается в 8 ГБ VRAM как минимум по площади",
+          size.width * size.height <= 1344 * 1024)
+}
+
+// Размер приходит из пресета, а не из отдельного поля: произвольного выбора нет.
+var sized = GenerationSettings()
+for preset in AspectPreset.allCases {
+    sized.aspect = preset
+    sized.applyAspect()
+    check("resolve(\(preset.rawValue)) даёт обучающий размер",
+          sized.width == preset.size.width && sized.height == preset.size.height)
 }
 
 print("=== 3. Валидация ===")
@@ -180,7 +203,6 @@ print("=== 6. Модель бюджета стадий ===")
 var big = GenerationSettings()
 big.prompt = String(repeating: "document page with a table and a signature, ", count: 12)
 big.aspect = .portrait34
-big.longEdge = 1024
 big.steps = 24
 let bigBudget = StageBudget.projected(settings: big)
 
