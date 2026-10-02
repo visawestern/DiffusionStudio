@@ -402,12 +402,13 @@ struct RootView: View {
                 Label("Размер", systemImage: "aspectratio")
                     .font(.system(size: 11, weight: .semibold))
 
-                FieldRow(label: "Размер", help: "Только те размеры, на которых модель обучалась. Другие пропорции она рисует криво: предметы вытягиваются, а мелкие детали рассыпаются. Нужный кадр проще вырезать или дорисовать в редакторе — это секунды, а лишняя генерация — часы.") {
-                    Picker("", selection: s.aspect) {
+                FieldRow(label: "Размер кадра", help: "Только те размеры, на которых модель обучалась. Другие пропорции она рисует криво: предметы вытягиваются, а мелкие детали рассыпаются. Нужный кадр проще вырезать или дорисовать в редакторе — это секунды, а лишняя генерация — часы.") {
+                    Picker("Размер кадра", selection: s.aspect) {
                         ForEach(AspectPreset.allCases) { Text($0.label).tag($0) }
                     }
                     .labelsHidden()
-                    .pickerStyle(.segmented)
+                    .pickerStyle(.menu)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
                 FieldRow(label: "Картинок за раз", help: "Batch count. Каждая следующая картинка добавляет полный проход по всем шагам, поэтому время растёт линейно.") {
