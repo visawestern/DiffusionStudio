@@ -370,6 +370,36 @@ func checkRunnerReplay() async {
         check("порог заметно больше нуля", floorExpected > 0.01)
         check("порог заметно меньше ста", floorExpected < 0.25)
     }
+
+    // Превью: файл preview.png рядом с выводом подхватывается посекундным
+    // опросом тика и показывается, пока нет финальной картинки.
+    check("превью лежит рядом с выводом",
+          big.previewURL.lastPathComponent == "preview.png"
+            && big.previewURL.deletingLastPathComponent().path == big.resolvedOutputDirectory)
+
+    let previewDir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ds_previewtest")
+    try? FileManager.default.removeItem(at: previewDir)
+    let previewSetup: Bool = {
+        guard (try? FileManager.default.createDirectory(at: previewDir, withIntermediateDirectories: true)) != nil,
+              let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 2, pixelsHigh: 2,
+                                         bitsPerSample: 8, samplesPerPixel: 3, hasAlpha: false,
+                                         isPlanar: false, colorSpaceName: .deviceRGB,
+                                         bytesPerRow: 6, bitsPerPixel: 24),
+              let png = rep.representation(using: .png, properties: [:]) else { return false }
+        return (try? png.write(to: previewDir.appendingPathComponent("preview.png"), options: [])) != nil
+    }()
+    check("тестовый preview.png создан", previewSetup)
+    var pvSettings = big
+    pvSettings.outputDirectory = previewDir.path
+    let pvr = GenerationRunner()
+    pvr.currentSettings = pvSettings
+    pvr.isRunning = true
+    pvr.refreshPreview()
+    check("preview.png подхватывается тиком", pvr.previewImage != nil)
+    pvr.refreshPreview()
+    check("повторный опрос превью стабилен", pvr.previewImage != nil)
+    try? FileManager.default.removeItem(at: previewDir)
 }
 
 

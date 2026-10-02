@@ -37,6 +37,7 @@ final class GenerationRunner: ObservableObject {
     @Published var secondsPerStep: Double = 0
     @Published var isRunning = false
     @Published var resultImage: NSImage?
+    @Published var previewImage: NSImage?
     @Published var exitMessage: String = ""
     @Published var lastRunSeconds: Double = 0
 
@@ -216,6 +217,7 @@ final class GenerationRunner: ObservableObject {
     private var pollTimer: Timer?
     private var startedAt: Date?
     private var lastStepObservedAt: Date?
+    private var lastPreviewDate: Date?
 
     func clearLog() {
         logLines.removeAll()
@@ -240,6 +242,8 @@ final class GenerationRunner: ObservableObject {
         stepsTotal = settings.steps
         secondsPerStep = 0
         resultImage = nil
+        previewImage = nil
+        lastPreviewDate = nil
         exitMessage = ""
         startedAt = Date()
         lastRunSeconds = 0
@@ -269,6 +273,8 @@ final class GenerationRunner: ObservableObject {
 
         lastKnownOutput = settings.outputURL
         logLines.removeAll()
+        // Прошлый preview.png — от чужого запуска, на старте он врёт.
+        try? FileManager.default.removeItem(at: settings.previewURL)
         append("$ " + requestDescription(settings))
 
         isRunning = true
@@ -573,6 +579,20 @@ final class GenerationRunner: ObservableObject {
         return String(text[swiftRange])
     }
 
+    /// Подбирает свежий preview.png, если шим успел записать новый кадр.
+    /// Вызывается секундным таймером: файл меняется только на границах шагов.
+    func refreshPreview() {
+        guard isRunning, let dir = currentSettings?.resolvedOutputDirectory else { return }
+        let url = URL(fileURLWithPath: dir).appendingPathComponent("preview.png")
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let mtime = attrs[.modificationDate] as? Date else { return }
+        if let last = lastPreviewDate, mtime <= last { return }
+        if let img = NSImage(contentsOf: url) {
+            previewImage = img
+            lastPreviewDate = mtime
+        }
+    }
+
     private func startPolling() {
         stopPolling()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -590,6 +610,7 @@ final class GenerationRunner: ObservableObject {
         if let lastStepObservedAt = lastStepObservedAt {
             samplingStepElapsed = Date().timeIntervalSince(lastStepObservedAt)
         }
+        refreshPreview()
         updateFraction()
     }
 

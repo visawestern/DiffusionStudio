@@ -364,6 +364,12 @@ struct GenerationSettings: Codable, Equatable {
             .appendingPathComponent(outputName.hasSuffix(".png") ? outputName : outputName + ".png")
     }
 
+    /// Промежуточный кадр: его пишет SDPreviewShim внутри sd-server на каждом
+    /// шаге сэмплирования. Приложение только читает файл и показывает его.
+    var previewURL: URL {
+        URL(fileURLWithPath: resolvedOutputDirectory).appendingPathComponent("preview.png")
+    }
+
     /// Бинарь движка. Генерацию выполняет `sd-server`: он держит веса в памяти
     /// между запусками, поэтому вторая картинка не читает модель заново.
     var binaryURL: URL {

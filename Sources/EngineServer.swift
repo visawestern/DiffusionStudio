@@ -119,6 +119,22 @@ final class EngineServer: ObservableObject {
         proc.arguments = Self.launchArguments(settings, port: port)
         proc.currentDirectoryURL = URL(fileURLWithPath: settings.rootPath)
 
+        // Превью шагов: подгружаем к серверу SDPreviewShim через
+        // DYLD_INSERT_LIBRARIES. Шим регистрирует sd_set_preview_callback
+        // (PREVIEW_PROJ, каждый шаг) и пишет preview.png в папку вывода.
+        // Сам бинарь sd-server при этом не меняется и не пересобирается.
+        var environment = ProcessInfo.processInfo.environment
+        if let shimURL = Bundle.main.resourceURL?.appendingPathComponent("SDPreviewShim.dylib"),
+           FileManager.default.fileExists(atPath: shimURL.path) {
+            try? FileManager.default.createDirectory(
+                atPath: settings.resolvedOutputDirectory,
+                withIntermediateDirectories: true
+            )
+            environment["DYLD_INSERT_LIBRARIES"] = shimURL.path
+            environment["DIFFUSION_STUDIO_PREVIEW_DIR"] = settings.resolvedOutputDirectory
+            append("— превью шагов включено: preview.png в папке вывода —")
+        }
+
         let outPipe = Pipe()
         let errPipe = Pipe()
         proc.standardOutput = outPipe
@@ -135,6 +151,7 @@ final class EngineServer: ObservableObject {
         }
         outPipe.fileHandleForReading.readabilityHandler = { outLines.feed($0.availableData) }
         errPipe.fileHandleForReading.readabilityHandler = { errLines.feed($0.availableData) }
+        proc.environment = environment
 
         do {
             try proc.run()

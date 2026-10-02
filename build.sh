@@ -38,6 +38,19 @@ if [[ ! -f "${ICON}" ]]; then
 fi
 cp "${ICON}" "${BUNDLE}/Contents/Resources/AppIcon.icns"
 
+echo "==> Шим превью (SDPreviewShim.dylib)"
+clang \
+  -dynamiclib \
+  -O2 \
+  -arch "${TARGET_ARCH}" \
+  -framework CoreFoundation \
+  -framework CoreGraphics \
+  -framework ImageIO \
+  -undefined dynamic_lookup \
+  Tools/sd_preview_shim.c Tools/sd_preview_png.c \
+  -o "build/SDPreviewShim.dylib"
+cp "build/SDPreviewShim.dylib" "${BUNDLE}/Contents/Resources/"
+
 cat > "${BUNDLE}/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

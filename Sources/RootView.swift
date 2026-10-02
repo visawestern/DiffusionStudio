@@ -872,7 +872,19 @@ struct RootView: View {
                 } else if runner.isRunning {
                     VStack(spacing: 12) {
                         Spacer()
-                        if runner.stage == .sampling, runner.samplingStepsTotal > 0 {
+                        if let preview = runner.previewImage {
+                            Image(nsImage: preview)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(maxHeight: geo.size.height * 0.6)
+                                .shadow(radius: 5)
+                            Text("Превью · шаг \(runner.samplingStepsDone) из \(runner.samplingStepsTotal)")
+                                .font(.system(size: 13, weight: .semibold))
+                            Text(runner.samplingRemainingText)
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        } else if runner.stage == .sampling, runner.samplingStepsTotal > 0 {
                             StepRing(done: runner.samplingStepsDone, total: runner.samplingStepsTotal)
                             Text(runner.samplingStepText)
                                 .font(.system(size: 13, weight: .semibold))
