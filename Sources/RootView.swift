@@ -1,106 +1,6 @@
 import AppKit
 import SwiftUI
 
-@MainActor
-final class SettingsModel: ObservableObject {
-    @Published var s: GenerationSettings
-
-    private let key = "DiffusionStudio.settings.v2"
-
-    init() {
-        if let data = UserDefaults.standard.data(forKey: key),
-           let decoded = try? JSONDecoder().decode(GenerationSettings.self, from: data) {
-            s = decoded
-        } else {
-            s = GenerationSettings()
-        }
-        normalize()
-        migrateIfNeeded()
-    }
-
-    private func migrateIfNeeded() {
-        if s.outputDirectory.isEmpty {
-            s.outputDirectory = URL(fileURLWithPath: s.rootPath).appendingPathComponent("outputs").path
-        }
-    }
-
-    func persist() {
-        if let data = try? JSONEncoder().encode(s) {
-            UserDefaults.standard.set(data, forKey: key)
-        }
-    }
-
-    func normalize() {
-        s.applyModelSet()
-        let r = s.resolvedSize
-        s.width = r.width
-        s.height = r.height
-        if s.outputDirectory.isEmpty {
-            s.outputDirectory = URL(fileURLWithPath: s.rootPath).appendingPathComponent("outputs").path
-        }
-        if s.threads <= 0 { s.threads = ProcessInfo.processInfo.activeProcessorCount / 2 }
-    }
-
-    func resetToDefaults() {
-        let keepDir = s.outputDirectory
-        s = GenerationSettings()
-        s.outputDirectory = keepDir
-        normalize()
-        persist()
-    }
-
-    func chooseOutputDirectory() {
-        if let url = FolderPicker.pick(title: "Куда сохранять картинки", start: s.resolvedOutputDirectory) {
-            s.outputDirectory = url.path
-        }
-    }
-
-    func ensureOutputDirectory() {
-        let url = URL(fileURLWithPath: s.resolvedOutputDirectory)
-        if !FileManager.default.fileExists(atPath: url.path) {
-            try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        }
-    }
-}
-
-enum FolderPicker {
-    static func pick(title: String, start: String) -> URL? {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.canCreateDirectories = true
-        panel.prompt = "Выбрать"
-        panel.message = title
-        if FileManager.default.fileExists(atPath: start) {
-            panel.directoryURL = URL(fileURLWithPath: start)
-        }
-        return panel.runModal() == .OK ? panel.url : nil
-    }
-}
-
-struct FieldRow<Content: View>: View {
-    let label: String
-    let help: String
-    @ViewBuilder var content: Content
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 4) {
-                Text(label)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                Image(systemName: "questionmark.circle")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
-                    .help(help)
-            }
-            content
-        }
-        .help(help)
-    }
-}
-
 struct LogSidebar: View {
     @ObservedObject var runner: GenerationRunner
     var onClose: () -> Void
@@ -243,6 +143,7 @@ struct RootView: View {
     @AppStorage("DiffusionStudio.logSidebar") private var logVisible = false
     @State private var didSync = false
     @FocusState private var promptFocused: Bool
+    @State private var showSettings = false
 
     private var s: Binding<GenerationSettings> { $model.s }
 
@@ -287,6 +188,9 @@ struct RootView: View {
                 didSync = true
                 model.ensureOutputDirectory()
             }
+        }
+        .sheet(isPresented: $showSettings) {
+            SettingsSheet(model: model, runner: runner)
         }
     }
 
@@ -347,7 +251,7 @@ struct RootView: View {
                 Label("Стоп", systemImage: "stop.fill")
             }
             .disabled(!runner.isRunning)
-            .help("Досрочно прервать процесс sd-cli")
+            .help("Досрочно отменить текущую задачу у sd-server")
 
             Button {
                 runner.runEnvironmentCheck()
@@ -355,6 +259,14 @@ struct RootView: View {
                 Image(systemName: "cpu")
             }
             .help("Показать список доступных вычислительных устройств (CPU / Metal / BLAS)")
+
+            Button {
+                showSettings = true
+            } label: {
+                Image(systemName: "gearshape")
+            }
+            .keyboardShortcut(",", modifiers: [.command])
+            .help("Настройки и диагностика: движок, модели, вычисления, оценка времени (⌘,)")
 
             Button {
                 model.chooseOutputDirectory()
@@ -400,7 +312,6 @@ struct RootView: View {
                 qualitySection
                 performanceSection
                 outputSection
-                estimateSection
             }
             .padding(12)
         }
@@ -419,114 +330,8 @@ struct RootView: View {
                     .labelsHidden()
                 }
 
-                FieldRow(label: "Движок", help: "Папка со stable-diffusion.cpp фиксирована: здесь лежат build/bin/sd-server и папка models. Менять её не нужно — выбирается только папка для сохранения картинок. Если переносите движок, задайте переменную окружения DIFFUSION_STUDIO_ROOT.") {
-                    Text(model.s.rootPath)
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .textSelection(.enabled)
-                }
-
-                engineRow
-
-                if model.s.modelSet == .qwenImage21Q6 {
-                    fileRow("Diffusion", value: model.s.diffusionModel, help: "Файл весов модели. Q6_K — качественный квант, 5.6 ГБ. Q4 был бы быстрее, но качество заметно хуже.")
-                    fileRow("Энкодер", value: model.s.encoderModel, help: "Текстовый энкодер Qwen3-VL 8B в int8, 9.35 ГБ. Полностью на CPU: в 8 ГБ VRAM он не помещается.")
-                    fileRow("VAE", value: model.s.vaeModel, help: "Декодер в bf16, 675 МБ. На CPU занимает около 10 минут при 768×1024.")
-                    Label(model.s.modelSet.memoryNote, systemImage: "info.circle")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
-                } else {
-                    fileRow("Diffusion", value: model.s.diffusionModel, help: "Имя файла в папке models. Расширение .gguf указывать обязательно.", editable: $model.s.diffusionModel)
-                    fileRow("Энкодер", value: model.s.encoderModel, help: "Имя файла в папке models. Должен совпадать с архитектурой диффузионной модели.", editable: $model.s.encoderModel)
-                    fileRow("VAE", value: model.s.vaeModel, help: "Имя файла в папке models. Должен соответствовать версии модели.", editable: $model.s.vaeModel)
-                }
             }
             .padding(6)
-        }
-    }
-
-    private var engineRow: some View {
-        FieldRow(label: "Состояние", help: engineHelp) {
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(engineColor)
-                    .frame(width: 7, height: 7)
-
-                Text(runner.engine.state.title)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-
-                if runner.engine.residentMegabytes > 1 {
-                    Text(String(format: "· %.1f ГБ в памяти", runner.engine.residentMegabytes / 1024))
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(runner.engine.isWarm ? Color.green : Color.secondary)
-                        .monospacedDigit()
-                }
-
-                Spacer()
-
-                if runner.engine.state == .stopped {
-                    Button {
-                        runner.engine.start(model.s)
-                    } label: {
-                        Image(systemName: "bolt.fill")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Запустить sd-server и держать веса модели в памяти")
-                } else {
-                    Button {
-                        runner.shutdownEngine()
-                    } label: {
-                        Image(systemName: "xmark.circle")
-                    }
-                    .buttonStyle(.borderless)
-                    .disabled(runner.isRunning)
-                    .help("Остановить sd-server и выгрузить 14.6 ГБ весов из памяти")
-                }
-            }
-        }
-    }
-
-    private var engineColor: Color {
-        switch runner.engine.state {
-        case .stopped: return Color.secondary
-        case .starting: return Color.orange
-        case .ready: return runner.engine.isWarm ? Color.green : Color.yellow
-        case .failed: return Color.red
-        }
-    }
-
-    private var engineHelp: String {
-        switch runner.engine.state {
-        case .stopped:
-            return "Движок не запущен. Веса модели в памяти нет — первая генерация прочитает 14.6 ГБ с диска."
-        case .starting:
-            return "Идёт чтение весов. Это происходит один раз: дальше sd-server держит модель в памяти и повторные генерации её не перечитывают."
-        case .ready:
-            return runner.engine.isWarm
-                ? "sd-server работает, 14.6 ГБ весов держатся в памяти. Следующая генерация начнётся сразу, без чтения модели с диска."
-                : "sd-server работает. Модель будет прочитана при первой генерации и останется в памяти."
-        case .failed(let why):
-            return "Движок не работает: " + why
-        }
-    }
-
-    private func fileRow(_ title: String, value: String, help: String, editable: Binding<String>? = nil) -> some View {
-        FieldRow(label: title, help: help) {
-            if let binding = editable {
-                TextField("имя файла в models/", text: binding)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 10, design: .monospaced))
-            } else {
-                Text(value)
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
         }
     }
 
@@ -597,31 +402,12 @@ struct RootView: View {
                 Label("Размер", systemImage: "aspectratio")
                     .font(.system(size: 11, weight: .semibold))
 
-                FieldRow(label: "Пропорции", help: "Все размеры автоматически округляются до кратных 64 — этого требует сетка модели. Промежуточных знароджений быть не может.") {
+                FieldRow(label: "Размер", help: "Только те размеры, на которых модель обучалась. Другие пропорции она рисует криво: предметы вытягиваются, а мелкие детали рассыпаются. Нужный кадр проще вырезать или дорисовать в редакторе — это секунды, а лишняя генерация — часы.") {
                     Picker("", selection: s.aspect) {
                         ForEach(AspectPreset.allCases) { Text($0.label).tag($0) }
                     }
                     .labelsHidden()
                     .pickerStyle(.segmented)
-                }
-
-                FieldRow(label: "Длинная сторона, px", help: "Размер по большей стороне. 512 — быстрые черновики, 768 — рабочий размер, 1024 и выше — долго. Каждый шаг стоит времени линейно по площади.") {
-                    HStack {
-                        Slider(value: Binding(
-                            get: { Double(model.s.longEdge) },
-                            set: { model.s.longEdge = Int($0) }
-                        ), in: 256...1536, step: 64)
-                        Text("\(model.s.longEdge)")
-                            .font(.system(size: 10, design: .monospaced))
-                            .frame(width: 42, alignment: .trailing)
-                    }
-                }
-
-                FieldRow(label: "Итоговый размер", help: "Показывает, что реально уйдёт в модель после округления до кратных 64.") {
-                    Text("\(model.s.width) × \(model.s.height)")
-                        .font(.system(size: 12, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, 3)
                 }
 
                 FieldRow(label: "Картинок за раз", help: "Batch count. Каждая следующая картинка добавляет полный проход по всем шагам, поэтому время растёт линейно.") {
@@ -716,11 +502,6 @@ struct RootView: View {
                     .labelsHidden()
                 }
 
-                Label(model.s.backend.hint, systemImage: "exclamationmark.triangle")
-                    .font(.system(size: 10))
-                    .foregroundStyle(model.s.backend == .auto ? Color.orange : Color.secondary.opacity(0.7))
-                    .fixedSize(horizontal: false, vertical: true)
-
                 FieldRow(label: "Потоков CPU, \(model.s.threads)", help: "Сколько ядер отдать вычислениям. На 16 логических ядрах оптимально 6-10: выше начинается contention с системой, и быстрее не становится.") {
                     HStack {
                         Slider(value: Binding(
@@ -742,13 +523,6 @@ struct RootView: View {
                     }
                 }
 
-                Divider()
-
-                FieldRow(label: "Промежуточное превью", help: "У sd-server нет превью: сервер отдаёт только готовый PNG. Пока идёт генерация, картинка появится в конце — за прогрессом следи по полосе и журналу.") {
-                    Label("не поддерживается сервером", systemImage: "xmark.circle")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                }
             }
             .padding(6)
         }
@@ -791,13 +565,6 @@ struct RootView: View {
                             .foregroundStyle(.tertiary)
                     }
                 }
-
-                Text(model.s.outputURL.path)
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-                    .truncationMode(.head)
-                    .help("Полный путь, который будет записан")
 
                 Divider()
 
@@ -845,85 +612,6 @@ struct RootView: View {
             .toggleStyle(.checkbox)
             .font(.system(size: 10))
             .help(help)
-    }
-
-    private var estimateSection: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 7) {
-                Label("Оценка и проверка", systemImage: "clock")
-                    .font(.system(size: 11, weight: .semibold))
-
-                Text(model.s.estimatedCostText)
-                    .font(.system(size: 10, design: .monospaced))
-                    .fixedSize(horizontal: false, vertical: true)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    ForEach(model.s.stageWeights, id: \.stage) { w in
-                        HStack(spacing: 6) {
-                            Text(w.stage.rawValue)
-                                .font(.system(size: 9))
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Text(GenerationSettings.human(w.seconds))
-                                .font(.system(size: 9, design: .monospaced))
-                                .foregroundStyle(.tertiary)
-                            Text(String(format: "%.1f%%", w.weight * 100))
-                                .font(.system(size: 9, weight: .medium, design: .rounded))
-                                .monospacedDigit()
-                                .foregroundStyle(.secondary)
-                                .frame(width: 38, alignment: .trailing)
-                        }
-                    }
-                }
-                .padding(.vertical, 2)
-
-                Text("Коэффициенты взяты из замеров этой модели на CPU: 1085 с на шаг при 768×1024, декод ≈ 638 с, кодирование ≈ 127 с + 1.34 с на токен, загрузка ≈ 168 с. Сэмплирование занимает больше 90% времени, поэтому полоса почти всё время идёт по нему — но как только sd-cli печатает реальную скорость шага, оценка пересчитывается по факту.")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                Label(model.s.estimatedMemoryText(), systemImage: "memorychip")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                if !model.s.problems.isEmpty {
-                    Divider()
-                    ForEach(model.s.problems, id: \.self) { p in
-                        Label(p, systemImage: "exclamationmark.triangle.fill")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.orange)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-
-                if let sw = swapUsedMB {
-                    Label("Своп сейчас: \(sw) МБ", systemImage: sw > 2000 ? "tortoise" : "hare")
-                        .font(.system(size: 10))
-                        .foregroundStyle(sw > 2000 ? Color.red : Color.green)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .help(sw > 2000
-                              ? "Много данных в свопе — генерация в разы медленнее. Закрой браузер и мессенджеры."
-                              : "Своп свободен, скорость будет нормальной.")
-                }
-            }
-            .padding(6)
-        }
-    }
-
-    private var swapUsedMB: Int? {
-        let out = Process()
-        out.executableURL = URL(fileURLWithPath: "/usr/sbin/sysctl")
-        out.arguments = ["-n", "vm.swapusage"]
-        let pipe = Pipe()
-        out.standardOutput = pipe
-        try? out.run()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let text = String(decoding: data, as: UTF8.self)
-        let parts = text.split(separator: " ").map(String.init)
-        guard let idx = parts.firstIndex(of: "used"), idx + 1 < parts.count else { return nil }
-        let number = parts[idx + 1].replacingOccurrences(of: "M", with: "")
-        return Double(number).map { Int($0) }
     }
 
     private var outputPanel: some View {

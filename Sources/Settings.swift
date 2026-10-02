@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 enum AppConstants {
@@ -74,45 +75,30 @@ enum ModelSet: String, CaseIterable, Identifiable, Codable {
 
 enum AspectPreset: String, CaseIterable, Identifiable, Codable {
     case square = "1:1"
-    case portrait34 = "3:4"
     case landscape43 = "4:3"
-    case portrait916 = "9:16"
+    case portrait34 = "3:4"
     case landscape169 = "16:9"
-    case a4 = "A4"
+    case portrait916 = "9:16"
 
     var id: String { rawValue }
 
-    var ratio: Double {
+    /// Размеры, на которых модель обучалась. Только эти: промежуточный размер
+    /// модель рисует криво — пропорции плывут, а мелкие детали рассыпаются.
+    /// Всё остальное проще доделать в редакторе, чем ждать искажённый результат.
+    var size: (width: Int, height: Int) {
         switch self {
-        case .square: return 1.0
-        case .portrait34: return 3.0 / 4.0
-        case .landscape43: return 4.0 / 3.0
-        case .portrait916: return 9.0 / 16.0
-        case .landscape169: return 16.0 / 9.0
-        case .a4: return 1.0 / 1.4142
+        case .square: return (1024, 1024)
+        case .landscape43: return (1024, 768)
+        case .portrait34: return (768, 1024)
+        case .landscape169: return (1344, 768)
+        case .portrait916: return (768, 1344)
         }
     }
 
     var label: String {
-        switch self {
-        case .a4: return "A4"
-        default: return rawValue
-        }
+        let s = size
+        return "\(rawValue) · \(s.width)×\(s.height)"
     }
-
-    func size(for longEdge: Int) -> (Int, Int) {
-        let raw: (Int, Int)
-        if self == .a4 {
-            raw = (longEdge, Int((Double(longEdge) * 1.4142).rounded()))
-        } else if ratio >= 1.0 {
-            raw = (longEdge, Int((Double(longEdge) / ratio).rounded()))
-        } else {
-            raw = (Int((Double(longEdge) * ratio).rounded()), longEdge)
-        }
-        return (snap(raw.0), snap(raw.1))
-    }
-
-    private func snap(_ v: Int) -> Int { max(64, ((v / 64) * 64)) }
 }
 
 enum Sampler: String, CaseIterable, Identifiable, Codable {
@@ -138,6 +124,82 @@ cartoony, anime, 3d render, cgi, painting, sketch, illustration, artificial skin
 """
 }
 
+enum FolderPicker {
+    static func pick(title: String, start: String) -> URL? {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Выбрать"
+        panel.message = title
+        if FileManager.default.fileExists(atPath: start) {
+            panel.directoryURL = URL(fileURLWithPath: start)
+        }
+        return panel.runModal() == .OK ? panel.url : nil
+    }
+}
+
+@MainActor
+final class SettingsModel: ObservableObject {
+    @Published var s: GenerationSettings
+
+    private let key = "DiffusionStudio.settings.v2"
+
+    init() {
+        if let data = UserDefaults.standard.data(forKey: key),
+           let decoded = try? JSONDecoder().decode(GenerationSettings.self, from: data) {
+            s = decoded
+        } else {
+            s = GenerationSettings()
+        }
+        normalize()
+        migrateIfNeeded()
+    }
+
+    private func migrateIfNeeded() {
+        if s.outputDirectory.isEmpty {
+            s.outputDirectory = URL(fileURLWithPath: s.rootPath).appendingPathComponent("outputs").path
+        }
+    }
+
+    func persist() {
+        if let data = try? JSONEncoder().encode(s) {
+            UserDefaults.standard.set(data, forKey: key)
+        }
+    }
+
+    func normalize() {
+        s.applyModelSet()
+        s.applyAspect()
+        if s.outputDirectory.isEmpty {
+            s.outputDirectory = URL(fileURLWithPath: s.rootPath).appendingPathComponent("outputs").path
+        }
+        if s.threads <= 0 { s.threads = ProcessInfo.processInfo.activeProcessorCount / 2 }
+    }
+
+    func resetToDefaults() {
+        let keepDir = s.outputDirectory
+        s = GenerationSettings()
+        s.outputDirectory = keepDir
+        normalize()
+        persist()
+    }
+
+    func chooseOutputDirectory() {
+        if let url = FolderPicker.pick(title: "Куда сохранять картинки", start: s.resolvedOutputDirectory) {
+            s.outputDirectory = url.path
+        }
+    }
+
+    func ensureOutputDirectory() {
+        let url = URL(fileURLWithPath: s.resolvedOutputDirectory)
+        if !FileManager.default.fileExists(atPath: url.path) {
+            try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        }
+    }
+}
+
 struct GenerationSettings: Codable, Equatable {
     var rootPath: String = AppConstants.defaultRoot
     var modelSet: ModelSet = .qwenImage21Q6
@@ -150,7 +212,6 @@ struct GenerationSettings: Codable, Equatable {
     var negativePrompt: String = Defaults.negative
 
     var aspect: AspectPreset = .portrait34
-    var longEdge: Int = 1024
     var width: Int = 768
     var height: Int = 1024
 
@@ -182,9 +243,13 @@ struct GenerationSettings: Codable, Equatable {
             : outputDirectory
     }
 
-    var resolvedSize: (width: Int, height: Int) {
-        let s = aspect.size(for: longEdge)
-        return (s.0, s.1)
+    var resolvedSize: (width: Int, height: Int) { aspect.size }
+
+    /// Размер всегда берётся из пресета пропорций: произвольных значений нет.
+    mutating func applyAspect() {
+        let r = resolvedSize
+        width = r.width
+        height = r.height
     }
 
     var outputURL: URL {

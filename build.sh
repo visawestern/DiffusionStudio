@@ -27,6 +27,7 @@ swiftc \
   Sources/EngineServer.swift \
   Sources/Runner.swift \
   Sources/Presets.swift \
+  Sources/SettingsSheet.swift \
   Sources/RootView.swift \
   Sources/App.swift
 
