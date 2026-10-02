@@ -1,5 +1,9 @@
 # Diffusion Studio
 
+[![macOS 14+](https://img.shields.io/badge/macOS-14%2B-0b5ed5?logo=apple&logoColor=white)](https://www.apple.com/macos/)
+[![Swift 5](https://img.shields.io/badge/Swift-5-FA7343?logo=swift&logoColor=white)](https://swift.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-c9a227.svg)](LICENSE)
+
 Локальный macOS-клиент для [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp).
 
 Никаких серверов, API-ключей и облачной подписки: приложение запускает `sd-cli` у вас на
