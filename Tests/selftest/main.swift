@@ -34,7 +34,7 @@ s.vaeTiling = false
 s.outputName = "argcheck"
 s.verbose = false
 
-let body = EngineServer.requestBody(s)
+let body = try EngineServer.requestBody(s)
 let json = String(data: try JSONSerialization.data(withJSONObject: body), encoding: .utf8) ?? ""
 print("  " + json)
 
@@ -70,13 +70,60 @@ s.cfgScale = 7.0
 s.sampler = .dpmPP2m
 s.vaeTiling = true
 s.aspect = .landscape169
-let body2 = EngineServer.requestBody(s)
+let body2 = try EngineServer.requestBody(s)
 print("  " + (String(data: try JSONSerialization.data(withJSONObject: body2), encoding: .utf8) ?? ""))
 check("random seed = -1", (body2["seed"] as? Int) == -1)
 check("negative prompt передан", body2["negative_prompt"] as? String == "blurry")
 check("смена сэмплера", (body2["sample_params"] as? [String: Any])?["sample_method"] as? String == "dpm++2m")
 check("16:9 даёт 1344x768", (body2["width"] as? Int) == 1344 && (body2["height"] as? Int) == 768)
 check("тайлинг включён флагом", ((body2["vae_tiling_params"] as? [String: Any])?["enabled"] as? Bool) == true)
+check("txt2img не шлёт init_image и strength",
+      body["init_image"] == nil && body["strength"] == nil && body["mask_image"] == nil)
+
+print("=== 1b. Режимы редактирования ===")
+
+let editDir = FileManager.default.temporaryDirectory.appendingPathComponent("ds_edittest")
+try? FileManager.default.removeItem(at: editDir)
+let editSetup: Bool = {
+    guard (try? FileManager.default.createDirectory(at: editDir, withIntermediateDirectories: true)) != nil,
+          let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 4, pixelsHigh: 4,
+                                     bitsPerSample: 8, samplesPerPixel: 3, hasAlpha: false,
+                                     isPlanar: false, colorSpaceName: .deviceRGB,
+                                     bytesPerRow: 12, bitsPerPixel: 24),
+          let png = rep.representation(using: .png, properties: [:]) else { return false }
+    let a = (try? png.write(to: editDir.appendingPathComponent("input.png"), options: [])) != nil
+    let b = (try? png.write(to: editDir.appendingPathComponent("mask.png"), options: [])) != nil
+    return a && b
+}()
+check("тестовые картинки созданы", editSetup)
+let inputBytes = try Data(contentsOf: editDir.appendingPathComponent("input.png"))
+
+var m = GenerationSettings()
+m.prompt = "перерисуй"
+m.mode = .imageToImage
+m.inputImagePath = editDir.appendingPathComponent("input.png").path
+m.strength = 0.6
+let bodyEdit = try EngineServer.requestBody(m)
+check("img2img кладёт init_image base64",
+      (Data(base64Encoded: bodyEdit["init_image"] as? String ?? "") ?? Data()) == inputBytes)
+check("img2img кладёт strength", (bodyEdit["strength"] as? Double) == 0.6)
+check("img2img без маски не шлёт mask_image", bodyEdit["mask_image"] == nil)
+
+m.mode = .inpaint
+m.maskImagePath = editDir.appendingPathComponent("mask.png").path
+let bodyMask = try EngineServer.requestBody(m)
+check("inpaint добавляет mask_image", (bodyMask["mask_image"] as? String)?.isEmpty == false)
+
+var mBad = GenerationSettings()
+mBad.prompt = "x"
+mBad.mode = .imageToImage
+check("img2img без картинки ловится", mBad.problems.contains { $0.contains("исходная картинка") })
+mBad.inputImagePath = "/нет/такого/файла.png"
+check("img2img с битым путём ловится", mBad.problems.contains { $0.contains("не найдена") })
+mBad.mode = .inpaint
+mBad.inputImagePath = editDir.appendingPathComponent("input.png").path
+check("inpaint без маски ловится", mBad.problems.contains { $0.contains("маска") })
+try? FileManager.default.removeItem(at: editDir)
 
 print("=== 1b. Отпечаток запуска движка ===")
 let fpA = EngineServer.launchFingerprint(s)

@@ -360,6 +360,7 @@ struct RootView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 modelSection
+                modeSection
                 promptSection
                 sizeSection
                 samplerSection
@@ -384,6 +385,69 @@ struct RootView: View {
                     .labelsHidden()
                 }
 
+            }
+            .padding(6)
+        }
+    }
+
+    private var modeSection: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 9) {
+                Label("Режим", systemImage: "wand.and.stars")
+                    .font(.system(size: 11, weight: .semibold))
+
+                FieldRow(label: "Что делать", help: "Текст → картинка — обычная генерация с нуля. Картинка → картинка — переписать исходник по промпту: сила задаёт, насколько далеко уйти от оригинала. Дорисовка по маске — переписать только белые области маски.") {
+                    Picker("Режим", selection: s.mode) {
+                        ForEach(GenerationMode.allCases) { Text($0.label).tag($0) }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                if model.s.mode.needsInputImage {
+                    FieldRow(label: "Исходная картинка", help: "Файл, который модель перепишет по промпту. PNG или JPEG.") {
+                        HStack(spacing: 6) {
+                            if let thumb = NSImage(contentsOfFile: model.s.inputImagePath) {
+                                Image(nsImage: thumb)
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fit)
+                                    .frame(width: 40, height: 40)
+                                    .cornerRadius(4)
+                            }
+                            Text(model.s.inputImagePath.isEmpty ? "не выбрана" : URL(fileURLWithPath: model.s.inputImagePath).lastPathComponent)
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(model.s.inputImagePath.isEmpty ? .tertiary : .primary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer()
+                            Button("Выбрать") { model.chooseInputImage() }
+                                .controlSize(.small)
+                                .help("Выбрать исходную картинку (PNG или JPEG)")
+                        }
+                    }
+
+                    FieldRow(label: "Сила переработки, \(String(format: "%.2f", model.s.strength))", help: "Насколько далеко уйти от исходника. 0.2–0.4 — лёгкая правка, 0.6–0.8 — сильная переработка, 1.0 — почти генерация с нуля.") {
+                        Slider(value: s.strength, in: 0.05...1.0, step: 0.05)
+                            .help("Слайдер силы переработки")
+                    }
+                }
+
+                if model.s.mode.needsMask {
+                    FieldRow(label: "Маска", help: "Чёрно-белая картинка того же размера: белые области модель дорисует заново, чёрные оставит как есть.") {
+                        HStack(spacing: 6) {
+                            Text(model.s.maskImagePath.isEmpty ? "не выбрана" : URL(fileURLWithPath: model.s.maskImagePath).lastPathComponent)
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(model.s.maskImagePath.isEmpty ? .tertiary : .primary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer()
+                            Button("Выбрать") { model.chooseMaskImage() }
+                                .controlSize(.small)
+                                .help("Выбрать маску (PNG или JPEG)")
+                        }
+                    }
+                }
             }
             .padding(6)
         }

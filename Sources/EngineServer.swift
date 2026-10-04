@@ -470,9 +470,9 @@ private func waitForJob(_ jobId: String, progress: @escaping @MainActor (String)
 
     // MARK: Тело запроса
 
-    static func requestBody(_ s: GenerationSettings) -> [String: Any] {
+    static func requestBody(_ s: GenerationSettings) throws -> [String: Any] {
         let size = s.resolvedSize
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "prompt": s.prompt,
             "negative_prompt": s.negativePrompt,
             "width": size.width,
@@ -495,7 +495,25 @@ private func waitForJob(_ jobId: String, progress: @escaping @MainActor (String)
             ],
             "output_format": "png",
         ]
+        // Режимы редактирования — тот же асинхронный img_gen: исходник уходит
+        // base64 в init_image, маска — в mask_image, а strength задаёт, насколько
+        // сильно переписать исходник (0 — почти копия, 1 — почти с нуля).
+        if s.mode.needsInputImage {
+            body["strength"] = max(0.05, min(1.0, s.strength))
+            body["init_image"] = try Self.base64Image(at: s.inputImagePath)
+        }
+        if s.mode.needsMask {
+            body["mask_image"] = try Self.base64Image(at: s.maskImagePath)
+        }
         return body
+    }
+
+    private static func base64Image(at path: String) throws -> String {
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        guard !data.isEmpty else {
+            throw EngineError.badResponse("Пустой файл картинки: \(path)")
+        }
+        return data.base64EncodedString()
     }
 
     private static func launchArguments(_ s: GenerationSettings, port: Int) -> [String] {

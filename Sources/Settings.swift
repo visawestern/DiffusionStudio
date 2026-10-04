@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import UniformTypeIdentifiers
 
 enum AppConstants {
     /// Папка stable-diffusion.cpp. В интерфейсе она не меняется: движок лежит
@@ -137,6 +138,31 @@ enum AspectPreset: String, CaseIterable, Identifiable, Codable {
     var label: String { rawValue }
 }
 
+/// Режим генерации. Все три — тот же асинхронный `img_gen` на сервере, поэтому
+/// опрос задач, прогресс по шагам и превью-шим работают одинаково: отличаются
+/// только поля запроса. Видео и апскейл сюда не входят — для них у Qwen нет
+/// весов на этой машине.
+enum GenerationMode: String, CaseIterable, Identifiable, Codable {
+    case textToImage = "textToImage"
+    case imageToImage = "imageToImage"
+    case inpaint = "inpaint"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .textToImage: return "Текст → картинка"
+        case .imageToImage: return "Картинка → картинка"
+        case .inpaint: return "Дорисовка по маске"
+        }
+    }
+
+    /// Нужна ли исходная картинка (`init_image` в запросе).
+    var needsInputImage: Bool { self != .textToImage }
+    /// Нужна ли маска (`mask_image` в запросе).
+    var needsMask: Bool { self == .inpaint }
+}
+
 enum Sampler: String, CaseIterable, Identifiable, Codable {
     case euler, euler_a, heun, dpm2, dpmPP2sA = "dpm++2s_a", dpmPP2m = "dpm++2m"
     case dpmPP2mv2 = "dpm++2mv2", ipndm, lcm, ddimTrailing = "ddim_trailing", tcd
@@ -171,6 +197,25 @@ enum FolderPicker {
         panel.message = title
         if FileManager.default.fileExists(atPath: start) {
             panel.directoryURL = URL(fileURLWithPath: start)
+        }
+        return panel.runModal() == .OK ? panel.url : nil
+    }
+}
+
+enum FilePicker {
+    static func pickImage(title: String, start: String) -> URL? {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.png, .jpeg]
+        panel.prompt = "Выбрать"
+        panel.message = title
+        if !start.isEmpty {
+            let url = URL(fileURLWithPath: start)
+            if FileManager.default.fileExists(atPath: url.deletingLastPathComponent().path) {
+                panel.directoryURL = url.deletingLastPathComponent()
+            }
         }
         return panel.runModal() == .OK ? panel.url : nil
     }
@@ -228,6 +273,18 @@ final class SettingsModel: ObservableObject {
         }
     }
 
+    func chooseInputImage() {
+        if let url = FilePicker.pickImage(title: "Исходная картинка для переработки", start: s.inputImagePath) {
+            s.inputImagePath = url.path
+        }
+    }
+
+    func chooseMaskImage() {
+        if let url = FilePicker.pickImage(title: "Маска: белое — дорисовать, чёрное — оставить", start: s.maskImagePath) {
+            s.maskImagePath = url.path
+        }
+    }
+
     func ensureOutputDirectory() {
         let url = URL(fileURLWithPath: s.resolvedOutputDirectory)
         if !FileManager.default.fileExists(atPath: url.path) {
@@ -245,6 +302,10 @@ struct GenerationSettings: Codable, Equatable {
         vaeModel = ModelSet.qwenImage21Q6.vae
         prompt = ""
         negativePrompt = Defaults.negative
+        mode = .textToImage
+        inputImagePath = ""
+        maskImagePath = ""
+        strength = 0.75
         aspect = .portrait34
         scale = .full
         width = 768
@@ -283,6 +344,10 @@ struct GenerationSettings: Codable, Equatable {
         vaeModel = try container.decodeIfPresent(String.self, forKey: .vaeModel) ?? defaults.vaeModel
         prompt = try container.decodeIfPresent(String.self, forKey: .prompt) ?? defaults.prompt
         negativePrompt = try container.decodeIfPresent(String.self, forKey: .negativePrompt) ?? defaults.negativePrompt
+        mode = try container.decodeIfPresent(GenerationMode.self, forKey: .mode) ?? defaults.mode
+        inputImagePath = try container.decodeIfPresent(String.self, forKey: .inputImagePath) ?? defaults.inputImagePath
+        maskImagePath = try container.decodeIfPresent(String.self, forKey: .maskImagePath) ?? defaults.maskImagePath
+        strength = try container.decodeIfPresent(Double.self, forKey: .strength) ?? defaults.strength
         aspect = try container.decodeIfPresent(AspectPreset.self, forKey: .aspect) ?? defaults.aspect
         scale = try container.decodeIfPresent(ResolutionScale.self, forKey: .scale) ?? defaults.scale
         width = try container.decodeIfPresent(Int.self, forKey: .width) ?? defaults.width
@@ -316,6 +381,11 @@ struct GenerationSettings: Codable, Equatable {
 
     var prompt: String
     var negativePrompt: String
+
+    var mode: GenerationMode
+    var inputImagePath: String
+    var maskImagePath: String
+    var strength: Double
 
     var aspect: AspectPreset
     var scale: ResolutionScale
@@ -387,6 +457,20 @@ struct GenerationSettings: Codable, Equatable {
         var out: [String] = []
         if prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             out.append("Промпт пустой.")
+        }
+        if mode.needsInputImage {
+            if inputImagePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                out.append("В режиме «\(mode.label)» нужна исходная картинка.")
+            } else if !FileManager.default.fileExists(atPath: inputImagePath) {
+                out.append("Исходная картинка не найдена: \(inputImagePath)")
+            }
+        }
+        if mode.needsMask {
+            if maskImagePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                out.append("В режиме «\(mode.label)» нужна маска.")
+            } else if !FileManager.default.fileExists(atPath: maskImagePath) {
+                out.append("Файл маски не найден: \(maskImagePath)")
+            }
         }
         if !FileManager.default.isExecutableFile(atPath: binaryURL.path) {
             out.append("Нет бинаря sd-server: \(binaryURL.path). Соберите его: cmake --build build --target sd-server")

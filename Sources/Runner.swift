@@ -292,9 +292,13 @@ final class GenerationRunner: ObservableObject {
 
     private func requestDescription(_ s: GenerationSettings) -> String {
         let size = s.resolvedSize
-        return "sd-server POST /sdcpp/v1/img_gen "
+        var text = "sd-server POST /sdcpp/v1/img_gen "
             + "\(size.width)x\(size.height) · \(s.steps) \(GenerationSettings.stepsWord(s.steps)) · "
             + "\(s.sampler.rawValue) · seed \(s.randomSeed ? -1 : s.seed)"
+        if s.mode.needsInputImage {
+            text += " · \(s.mode.label), сила \(String(format: "%.2f", s.strength))"
+        }
+        return text
     }
 
     private func performRun(_ settings: GenerationSettings) async {
